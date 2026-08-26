@@ -1,6 +1,13 @@
 # DeepEP V1 SM 通信方案详解
 
 > 本文对应仓库中的 **V1 legacy normal / high-throughput** 路径。这里的“SM 通信方案”指由常驻 CUDA 通信内核占用一定数量的 SM，使用 GPU 线程主动完成队列管理、数据搬运、NVLink 访问和 IBGDA RDMA 发起的方案；它不是 V1 的 `low_latency_dispatch/low_latency_combine` 路径。
+> **研究双基线：**本地教程文档基线为 `f99f06868616c6fa96f83ff1caa5f0231f9ee3bc`（2026-08-25），该提交仅新增三篇 implementation 文档；实际 DeepEP 上游源码基线为其父提交 `01dc3aaac82068020353dce2c302e38153c0bfaa`（deepseek-ai `origin/main`，2026-08-04）。本文在 2026-08-26 重新核对了该上游源码、仓库新增的两份专题研究稿、DeepSeek-V3 技术报告以及 NVIDIA CUDA/NVSHMEM 官方文档。仓库 `docs/legacy.md` 明确提示开源实现可能与论文略有不同；二者冲突时，本文描述“上述上游源码 commit 怎么做”，论文只用于解释设计背景。
+
+本文用三个标签区分证据强度：
+
+- **【源码可证】**：能由上述上游源码 commit 的代码、注释、断言或测试直接确认。
+- **【官方资料背景】**：来自 DeepEP/DeepSeek 或 NVIDIA 官方文档，用于解释设计动机和硬件语义。
+- **【推导/调优假设】**：由源码结构推演出的性能模型、故障假设或实验建议；需要在目标集群上测量，不能当成实现保证。
 
 ## 1. 方案定位
 
@@ -278,13 +285,22 @@ num_max_rdma_chunked_send_tokens
 num_max_rdma_chunked_recv_tokens
 ```
 
-normal 内核将两个 block/SM 配成一个 channel：
+normal 内核将两个 CUDA block 配成一个 channel：
 
 ```text
 num_channels = num_sms / 2
-偶数 block：发送/转发
-奇数 block：接收/规约
+channel c = block 2c + block 2c+1
 ```
+
+**【源码可证】** 变量 `sm_id` 实际赋值为 `blockIdx.x`，所以它是逻辑 block 编号，不是 CUDA 提供的物理 SM 编号。项目按“一个重型通信 block 通常占据一个物理 SM”的资源模型把 grid 大小命名为 `num_sms`，但调度器并不保证 `blockIdx.x == 6` 就运行在物理 SM 6。
+
+两 block 的具体职责必须按 kernel 区分：
+
+| kernel | `block 2c` | `block 2c+1` |
+|---|---|---|
+| intranode dispatch/combine | sender | receiver/reducer |
+| internode dispatch | RDMA→NVLink Forward block | RDMA Sender + NVLink Receiver block |
+| internode combine | NVLink Sender + RDMA Receiver block | NVLink→RDMA Forward/Reduce block |
 
 因此 `Buffer.set_num_sms()` 要求偶数。chunk 参数决定每次推进多少 token 和环形队列容量。RDMA send chunk 不得超过 recv capacity 的一半，这是 lazy head update 能安全运行、避免生产者覆盖未消费数据的必要条件。
 
@@ -431,6 +447,138 @@ flowchart LR
 
 block 仍按偶/奇分工：偶数 block 偏 forward，奇数 block 包含 RDMA sender 和 NVLink receiver；两个 block 组成一个 channel。
 
+#### 8.2.1 Channel、block、warp、lane 的精确映射
+
+**【源码可证】** internode dispatch 的 launch 形状是：
+
+```cpp
+constexpr int kNumDispatchRDMASenderWarps = 7;
+gridDim.x  = num_channels * 2;
+blockDim.x = (7 + 1 + 8) * 32;  // 512 threads, 16 warps
+```
+
+kernel 内部再计算：
+
+```cpp
+num_channels = gridDim.x / 2;
+channel_id   = blockIdx.x / 2;
+is_forwarder = blockIdx.x % 2 == 0;
+```
+
+若 `num_sms=20`，则得到 10 个 channel：
+
+```text
+channel 0 = block  0 Forward + block  1 Sender/Receiver
+channel 1 = block  2 Forward + block  3 Sender/Receiver
+...
+channel 9 = block 18 Forward + block 19 Sender/Receiver
+```
+
+**【官方资料背景】** DeepSeek-V3 技术报告使用“20 SM、10 个通信 channel”的描述，并把 dispatch 分成 IB sending、IB→NVLink forwarding、NVLink receiving 三类 warp。当前仓库把这一思想落实为固定的 block/warp 角色；但 20 只是论文集群和常见配置，不是 API 常量。
+
+#### 8.2.2 Channel 如何划 token，而不是划目的地
+
+每张源 GPU 独立把本地 `T` 个 token 按连续区间分给 `C` 个 channel：
+
+```text
+per_channel = ceil_div(T, C)
+start(c) = min(per_channel * c, T)
+end(c)   = min(start(c) + per_channel, T)
+```
+
+例如 `T=103, C=10`，channel 0～8 各处理 11 个 token，channel 9 处理最后 4 个。随后，奇数 S/R block 内 7 个 Sender warp 再按 channel 内局部序号分片：
+
+```text
+sender_warp(t) = (t - start(channel)) mod 7
+```
+
+所以一个 token 即使 top-k 命中多个节点和多个 GPU，也只属于一个 channel。channel 决定“哪段源 token、哪套 ring/QP/block”；top-k 决定“发到哪些节点和 GPU”。
+
+channel id 在整条 dispatch 路径上保持不变：
+
+```text
+源 GPU channel c
+  -> channel c RDMA send/recv ring
+  -> 远端同号 GPU channel c Forward block
+  -> 目标 GPU channel c NVLink queue
+  -> 目标 GPU channel c Receiver warp
+```
+
+它不需要写进每条 token message，因为 `channel_id` 已编码在 block、`SymBuffer/AsymBuffer` 的基址偏移、prefix matrix 和 QP 选择中。
+
+#### 8.2.3 两类 block 的 16-warp 表
+
+设当前 channel 为 `c`：
+
+| block | warp | 角色 | 固定对象/任务 |
+|---|---:|---|---|
+| 偶数 Forward | 0～7 | `kRDMAAndNVLForwarder` | `dst_nvl_rank=(warp+c)%8`，八个 warp 覆盖目标 GPU 0～7 |
+| 偶数 Forward | 8 | 有效 `kForwarderCoordinator` | 汇总八个 Forwarder 的安全消费进度 |
+| 偶数 Forward | 9～15 | extra coordinator | 因 `target_rank>0` 直接返回 |
+| 奇数 S/R | 0～6 | `kRDMASender` | channel 内 token 按局部序号模 7 分片 |
+| 奇数 S/R | 7 | `kRDMASenderCoordinator` | 把连续完成前缀组成 chunk，构造 WQE 并发布 RDMA tail |
+| 奇数 S/R | 8～15 | `kNVLReceivers` | `src_nvl_rank=(warp+c-7)%8`，八个 warp 覆盖来源 Forward GPU 0～7 |
+
+这里有两个很容易混淆的维度：
+
+- 一个 Forwarder **warp** 固定一个目标 NVLink GPU；warp 内有效 **lane** 才分别保存不同来源 RDMA rank 的状态。
+- 一个 NVLReceiver **warp** 固定一个来源 Forward GPU；warp 内有效 **lane** 仍分别保存 token 原始来源 RDMA rank 的 prefix/offset。
+
+以 channel 3 为例：
+
+```text
+Forward block 6:
+  warp 0..7 -> dst GPU 3,4,5,6,7,0,1,2
+  warp 8    -> active ForwarderCoordinator
+
+S/R block 7:
+  warp 0..6 -> Sender
+  warp 7    -> SenderCoordinator
+  warp 8..15-> src Forward GPU 4,5,6,7,0,1,2,3
+```
+
+因此目标 GPU 上负责“channel 3、来源 Forward GPU5”的是 warp 9；可由下式定位：
+
+```text
+forward_warp(c, dst_gpu) = (dst_gpu - c) mod 8
+receiver_warp(c, src_forward_gpu)
+    = 8 + (src_forward_gpu - c - 1) mod 8
+```
+
+#### 8.2.4 Lane 不是永久职位：分阶段解释
+
+| warp 角色与阶段 | lane 的含义 |
+|---|---|
+| Sender 构造 18-int 目录 | lane 0～7 写 GPU start，8～15 写 GPU end，16/17 写节点 start/end |
+| Sender 遍历 token | lane `r` 代表目标 RDMA rank `r`，保存 mask、logical tail 和 remote head |
+| Sender 搬 payload | 32 lanes 用 `int4`/循环合作搬 hidden、scale、top-k；前若干 lane 写各目标节点的 `SourceMeta` |
+| SenderCoordinator 控制 | lane `r` 保存目标 RDMA rank `r` 的剩余量和 `last_issued_tail`；整个 warp 合作填 WQE |
+| Forwarder 等 meta/data | 整个 warp 固定目标 GPU；lane `r` 保存来源 RDMA rank `r` 的 count/head/tail |
+| Forwarder TMA | elected leader 发起 TMA，其他 lane 参加同步和 per-source 控制 |
+| ForwarderCoordinator | lane `r` 汇总来源 RDMA rank `r` 在八个 Forwarder 中的最小安全 head |
+| NVLReceiver prefix | 整个 warp 固定来源 Forward GPU；lane `r` 保存原始来源 RDMA rank `r` 的最终输出 offset |
+| NVLReceiver 搬运 | leader 处理 TMA，lane `k` 可处理第 `k` 个 top-k 项 |
+
+Sender 的并发生产还需要一个 32-bit completion window。7 个 Sender warp 可能按 `0,2,1,4,3` 的次序完成，Coordinator 只能发布无空洞的连续前缀。每个目标 RDMA rank 都有：
+
+```cpp
+rdma_send_channel_lock[dst]
+rdma_send_channel_tail[dst]
+rdma_send_channel_window[dst]
+```
+
+Sender 在锁内设置对应 bit；若 bit 0 开始形成连续 1 串，就用 CTA-scope release store 推进 `rdma_send_channel_tail`。Coordinator 用 CTA-scope acquire load 观察它。这一层是**同一 block 内**的生产者/消费者协议，不是远端 RDMA tail。
+
+#### 8.2.5 三种同步边界
+
+| 范围 | 源码机制 | 不能做什么 |
+|---|---|---|
+| warp 内 | `__syncwarp`、shuffle、ballot/reduce、elected leader、TMA mbarrier | 不能同步同 block 的其他 warp |
+| block 内 | named `barrier.sync`、shared-memory lock/window/head | 不能同步另一个 channel block |
+| block/GPU/节点间 | global HBM、CUDA IPC/NVLink、NVSHMEM symmetric heap、system-scope load/store、IBGDA put/AMO | 不能依赖 CUDA shared memory 或 `__syncthreads` |
+
+Forward block 与 S/R block 即使在同一 GPU 上，也不能共享 CUDA shared memory；它们通过全局队列状态交互。跨 GPU 的 head/tail 则必须使用能覆盖 peer GPU 的 system scope 或 RDMA 操作。
+
 ### 8.3 RDMA 消息内容
 
 每个 token 消息连续包含：
@@ -460,6 +608,177 @@ tail - remote_head < capacity
 ```
 
 消费者按 release/acquire 顺序观察 tail，处理完成后更新 head。coordinator 不对每个 token 都发 atomic，而是按 chunk 批量推进 head/tail，减少 NIC 原子操作和 doorbell 开销。
+
+#### 8.4.1 不要混淆两类 metadata
+
+V1 internode dispatch 同时存在两种不同的 metadata：
+
+| 名称 | 大小/粒度 | 放在哪里 | 作用 |
+|---|---:|---|---|
+| `rdma_channel_meta` 目录 | 每个 `(channel, source node)` 18 个 `int`，72 B | 独立的对称 send/recv 区 | 告诉 Forwarder 本 channel 的 GPU 级和节点级 prefix 范围 |
+| `SourceMeta` | 每个 token 2 个 `int`，8 B | 嵌在 token payload 中 | 保存 `src_rdma_rank` 和目标节点内 8-bit GPU fan-out 位图 |
+
+18-int 目录的布局为：
+
+```text
+meta[0..7]   = 目标 GPU0..7 的 channel start prefix
+meta[8..15]  = 目标 GPU0..7 的 channel end prefix
+meta[16]     = 本 channel 在目标节点的 RDMA start prefix
+meta[17]     = 本 channel 在目标节点的 RDMA end prefix
+```
+
+某个固定目标 GPU `d` 的 Forwarder warp 只读取：
+
+```text
+meta[d], meta[8+d], meta[16], meta[17]
+```
+
+目录值用 `encoded=-value-1` 发布。这样合法 prefix 0 编成 -1，而清零后的“尚未到达”仍为 0；Forwarder 观察到四项都小于 0 后再解码。这里的“四 meta”是“一个 Forwarder 从 18 项目录中选择四项”，不是网络只传四个整数。
+
+`SourceMeta` 则是：
+
+```cpp
+struct SourceMeta {
+    int src_rdma_rank;
+    int is_token_in_nvl_rank_bits;
+};
+```
+
+若一个 token 在目标节点同时命中 GPU3、GPU7，位图同时设置 bit3/bit7；跨节点只发送一份 hidden，目标节点两个 Forwarder warp 分别检查位图并 fan-out。
+
+#### 8.4.2 `SymBuffer` 与 `AsymBuffer` 的地址维度
+
+**【源码可证】** `SymBuffer<T,true>` 按“所有 channel 的 send 段 + 所有 channel 的 recv 段”分配；构造时已经把 `channel_id` 烤进基指针：
+
+```text
+send_ptr = base + per_channel_bytes * channel_id
+recv_ptr = base + per_channel_bytes * (channel_id + num_channels)
+```
+
+随后 `send_buffer(dst)` 或 `recv_buffer(src)` 才选择 peer slot。因此：
+
+```text
+source S: send_buffer(D)  = “to D”
+target D: recv_buffer(S)  = “from S”
+```
+
+二者不是同一物理显存或相同用途的地址。NVSHMEM 的“对称”表示每个 PE 按同一规则拥有对应对象/偏移，远端访问由 `(symmetric address, destination PE)` 定位；不是所有 GPU 共享一页物理 HBM。
+
+`SymBuffer<T,false>` 用于单向语义固定的 head/tail，只保留一段 `buffer(peer)`。`AsymBuffer` 用在 CUDA IPC 映射的节点内 buffer；它使用相同的 channel/peer 偏移公式，但各 GPU 的物理地址由 `buffer_ptrs[]` 选择。
+
+两级 queue 的物理所有权可归纳为：
+
+| 状态 | 物理所在 GPU | 写者 | 读者 |
+|---|---|---|---|
+| RDMA payload/meta recv | 目标节点同号 GPU | 远端 NIC put | 目标节点 Forwarder |
+| RDMA tail | 目标节点同号 GPU，slot=来源节点 | 源 SenderCoordinator 的远端 AMO | Forwarder |
+| RDMA head/credit | 源 GPU，slot=目标节点 | 目标 ForwarderCoordinator 的远端 AMO | 源 Sender |
+| NVL payload/prefix/tail | 最终目标 GPU，slot=来源 Forward GPU | Forwarder 经 IPC/NVLink 写 | NVLReceiver |
+| NVL head/credit | Forward GPU，slot=最终目标 GPU | NVLReceiver 经 IPC/NVLink 写回 | Forwarder |
+
+这张表比“send/recv 地址相同”更接近代码：数据/发布指针尽量放在 consumer 本地，credit 指针尽量放在 producer 本地。
+
+#### 8.4.3 从 payload 写入到 tail 发布的内存顺序
+
+下面严格区分代码事实和可移植性边界。
+
+**【源码可证】RDMA 侧：**
+
+1. Sender warp 先把目录写入本地对称 send 区，并调用自定义 `nvshmemi_ibgda_put_nbi_warp<true>`。
+2. Sender 将 token payload 写到本地 send ring；completion window 只把无空洞的连续前缀交给 Coordinator。
+3. Coordinator 对一个连续 chunk 调用 `put_nbi_warp`。该 helper 根据本地/远端 registration granularity 查找 lkey/rkey；跨注册 chunk 时会拆成多个 WQE，由不同 lane 填写。
+4. `ibgda_submit_requests` 在更新 doorbell 前执行 `__threadfence()`，并按保留的 WQE 索引串行推进 ready head。
+5. payload WQE 提交后，Coordinator 在同一 `channel_id` QP 上提交 RDMA atomic add，推进目标 `rdma_channel_tail`。
+6. 远端 Forwarder 用 system-scope acquire load 读取 tail 后，才读取相应 payload slot。
+
+**【源码可证】NVLink/IPC 侧：**
+
+1. Forwarder 通过 TMA 把一条完整 message 从 RDMA ring 搬到目标 GPU 的 IPC queue。
+2. 它执行 `tma_store_wait<0>()`，再以 system-scope release store 推进目标 GPU 上的 NVL tail。
+3. NVLReceiver 用 system-scope acquire load 观察 tail，随后读取 payload。
+4. 消费完成后，Receiver 更新位于 Forward GPU 的 NVL head；Forwarder看到 credit 后才能复用槽位。
+
+**【官方资料背景】** CUDA 文档说明 system scope 覆盖 CPU、其他 GPU及相连缓存，release/acquire 用于建立 producer-consumer 顺序；TMA 属于异步代理操作，必须配合 mbarrier、proxy fence 和完成等待。NVSHMEM 文档则明确区分 `fence`（排序）与 `quiet`（完成），并强调不同 QP 之间没有天然顺序。
+
+**【实现边界/推导】** 当前 V1 normal 直接调用 NVSHMEM 的内部 IBGDA 设备实现，而不是只使用公开的高层 put/fence/signal API。代码通过同一 RC QP 的 WQE 预留/提交顺序把 payload put 排在 tail AMO 前，并由接收端 tail acquire 作为可消费边界。这是当前源码协议，不能推广成“所有 NVSHMEM nonblocking put 天然在 flag 前完成”，也不能推广成“跨 QP 全序”。
+
+72 B 目录同样不能称为“72 B 原子到达”：
+
+- 上层只有一次逻辑 put 调用；
+- helper 可能因 registration chunk 边界拆成多个 WQE；
+- 普通 RDMA write 不为任意 72 B 提供“全旧或全新”的事务原子性保证；
+- meta 表示预计范围，真正的 payload 可消费进度仍由 tail 协议决定。
+
+#### 8.4.4 Credit、lazy head update 与端到端 backpressure
+
+RDMA/NVL ring 都使用单调逻辑索引，物理槽位才取模：
+
+```text
+physical_slot = logical_index % capacity
+used          = tail - head
+free          = capacity - used
+```
+
+生产者只有在 `free >= next_chunk` 时才能继续。消费者不会每个 token 都立即发远端原子；Coordinator 批量归还 credit，以降低 AMO/WQE/doorbell 开销。
+
+`Config` 强制：
+
+```text
+rdma_send_chunk <= rdma_recv_capacity / 2
+```
+
+**【源码可证】** 该断言的注释明确关联 RDMA lazy head update：即使 credit 暂未按每个 token回传，也必须保证 Sender 总能找到足够空间推进一个合法 chunk。
+
+ForwarderCoordinator 对某来源节点的 8 个目标 GPU Forwarder head 取最小值。原因不是做负载均衡，而是同一 RDMA slot 可能仍要被多个目标 Forwarder 扫描；只有全部活跃读者越过该 slot 才能复用。
+
+背压链为：
+
+```text
+目标 NVLReceiver 变慢
+  -> NVL head 不前进
+  -> 对应 Forwarder 的 NVL ring 变满
+  -> Forwarder 无法继续扫描/转发 RDMA ring
+  -> ForwarderCoordinator 的 min RDMA head 不前进
+  -> 源 Sender 的 RDMA ring credit 耗尽
+  -> 源端停止生产
+```
+
+**【推导/调优假设】** 这种安全最小值会产生 head-of-line blocking：一个慢目标 GPU 可能限制同一来源 ring 对其他目标 GPU 的复用进度。它是共享、节省显存的节点级去重 payload 所付出的代价。
+
+#### 8.4.5 一条 token 的完整路径：Node0 GPU5 → Node1 GPU3
+
+假设每节点 8 GPU，源 global rank 5，目标 expert 在 global rank 11：
+
+```text
+source: Node0 GPU5 = (rdma_rank=0, nvl_rank=5)
+relay : Node1 GPU5 = (rdma_rank=1, nvl_rank=5)
+target: Node1 GPU3 = (rdma_rank=1, nvl_rank=3)
+```
+
+再假设 token `t` 落入 channel 3：
+
+1. **Layout。** `is_token_in_rank[t,11]=true`；发往目标节点1的 8-bit mask 设置 GPU3 位。若同时命中 Node1 GPU7，也只增加 bit7，不增加第二份节点级 RDMA hidden。
+2. **源 Sender。** Node0 GPU5 的 channel3 对应 S/R block7；`(t-start(3)) mod 7` 决定 Sender warp。lane1 代表目标 RDMA rank1，等待 ring credit，整个 warp 写 hidden、scale、`SourceMeta`、top-k。
+3. **SenderCoordinator。** block7 warp7 等连续前缀可发，源地址为 Node0 GPU5 的 `ch3 send_buffer(dst_node=1)`；远端地址为 Node1 GPU5 的 `ch3 recv_buffer(src_node=0)`。目标 PE 是“同号 GPU5”，不是最终 GPU3。
+4. **RDMA Forward。** Node1 GPU5 的 channel3 Forward block6 中，目标 GPU3 对应 `(3-3) mod 8=warp0`。其 lane0 保存来源节点0状态；warp0 等 meta/tail，读取 token并检查 `SourceMeta.bit3`。
+5. **NVLink forward。** warp0 把 token 写入 Node1 GPU3 的“channel3、来源 Forward GPU5”queue，完成 TMA 后 release 发布 NVL tail。
+6. **最终 Receiver。** Node1 GPU3 的 channel3 S/R block7 中，来源 GPU5 对应 `8+(5-3-1) mod 8=warp9`。warp9 acquire tail，用 `SourceMeta.src_rdma_rank=0` 选择 lane0 保存的输出 offset，写 `recv_x`、local top-k、weights 和 `recv_src_meta`。
+7. **保存反向路由。** 源侧 `send_rdma_head`、中转侧 `send_nvl_head`、目标侧 `recv_src_meta` 与各级 prefix 进入 dispatch handle，供 combine 使用。
+8. **反向 credit。** GPU3 Receiver 写回 NVL head；GPU5 Forwarder推进扫描进度；GPU5 Coordinator 取安全最小值并对 Node0 GPU5 的 RDMA head做 AMO；源 Sender 获得槽位复用权。
+
+```mermaid
+flowchart LR
+    A[Node0 GPU5\nch3 Sender] --> B[ch3 RDMA send ring]
+    B --> C[SenderCoordinator]
+    C -->|IBGDA| D[Node1 GPU5\nch3 RDMA recv ring]
+    D --> E[ch3 Forward warp0\ndst GPU3]
+    E -->|CUDA IPC / NVLink| F[Node1 GPU3\nch3 queue from GPU5]
+    F --> G[ch3 Receiver warp9]
+    G --> H[recv_x / routing handle]
+    G -. NVL head .-> E
+    E -. progress .-> I[ForwarderCoordinator]
+    I -. RDMA head AMO .-> A
+```
 
 ### 8.5 跨节点 handle
 
@@ -523,6 +842,94 @@ combine 走 dispatch 的逆拓扑：
 ```
 
 跨节点 combine 仍区分 sender、forwarder、RDMA receiver 和 coordinator。其关键点不是简单原样回传，而是尽量在层次结构中提前规约，减少跨层传输量；最终根据 `SourceMeta`、prefix 和 head 信息把多个 expert 输出合并到 `combined_x[src_token]`。
+
+### 9.3 为什么 combine 不是 dispatch 的“录像倒放”
+
+语义上 combine 逆着路由回到原 token；实现上却要做 fan-in 与规约，因此重新定义了角色：
+
+```cpp
+enum class WarpRole {
+    kNVLSender,
+    kNVLAndRDMAForwarder,
+    kRDMAReceiver,
+    kCoordinator
+};
+const bool is_forwarder_sm = blockIdx.x % 2 == 1;
+```
+
+这与 dispatch 的偶数 Forward block 正好相反。不能把 dispatch 的 16-warp 表直接倒序套用。
+
+**【源码可证】** 当前代码设置 `kNumCombineForwarderWarps=24`，但实际每个 block 的 warp 数取决于 RDMA rank 数 `R`：
+
+```text
+warps_per_rdma = max(24 / R, 1)
+num_forwarders = R * warps_per_rdma
+block_warps    = num_forwarders + 1
+num_rdma_receivers = num_forwarders - 8
+```
+
+角色映射为：
+
+| block | warp 范围 | 角色 |
+|---|---|---|
+| 偶数 non-forwarder | 0～7 | 8 个 `kNVLSender`，分别面向一个节点内目的 GPU |
+| 偶数 non-forwarder | 8～`num_forwarders-1` | `kRDMAReceiver`，最终接收并规约跨节点 partial |
+| 偶数 non-forwarder | 最后一个 warp | `kCoordinator`，归还 RDMA credit |
+| 奇数 forwarder | 0～`num_forwarders-1` | `kNVLAndRDMAForwarder`，按目标 RDMA rank 分组 |
+| 奇数 forwarder | 最后一个 warp | `kCoordinator`，归还 NVLink credit |
+
+完整回程是：
+
+1. **NVL Sender。** expert GPU 根据 dispatch 的 `gbl_channel_prefix_matrix`、`recv_src_meta` 和 `send_nvl_head`，把 expert 输出及可选 top-k weight 写入目标节点内“原来源同号 GPU”的 NVLink queue。
+2. **NVL→RDMA Forward/Reduce。** 边界 GPU 按目标 RDMA rank读取最多 8 个本地 GPU queue。`combine_token` 在写 RDMA send ring 前先把同一原 token 的节点内贡献相加；因此发往源节点的是节点级 partial，而不是逐 expert 原样消息。
+3. **RDMA Receiver/Reduce。** 原来源同号 GPU 根据 `send_rdma_head` 等待各来源节点 partial，在最终位置上继续相加，并可融合 0、1 或 2 个 BF16 bias。
+4. **两级 Coordinator。** 一侧汇总 NVLink consumer head，另一侧汇总 RDMA receiver head，按安全最小进度批量归还 credit。
+
+这种提前规约解释了 combine 的非镜像性：
+
+```text
+dispatch: 一份节点级 token -> 目标节点内 fan-out
+combine : 节点内多份 expert result -> 节点级 partial -> 跨节点 fan-in
+```
+
+### 9.4 “addition without weights”的准确语义
+
+Python docstring 明确写的是 `addition without weights`。因此向量结果可抽象为：
+
+```text
+combined_x[t,h]
+  = bias_0[t,h] + bias_1[t,h]
+  + sum(valid received expert_output[j,h])
+```
+
+若传入 `topk_weights`，kernel 会沿相同 queue 传输并**单独加和**：
+
+```text
+combined_topk_weights[t,k]
+  = sum(valid received topk_weights[j,k])
+```
+
+它不会在通信 kernel 内执行：
+
+```text
+combined_x += weight * expert_output
+```
+
+上层若需要门控加权，必须保证输入 `x` 已符合约定，或在通信前后另行处理。把“combine 返回了 reduced top-k weights”误读成“combine 已用这些 weights 乘过向量”，会产生静默数值错误。
+
+### 9.5 Handle 是反向路由日志，不只是缓存
+
+跨节点 handle 中各字段对应 combine 的具体依赖：
+
+| handle 字段 | dispatch 写入内容 | combine 用途 |
+|---|---|---|
+| `is_token_in_rank` | token 是否命中最终 rank | 确定哪些原 token 有回程贡献 |
+| RDMA/global channel prefix | 两级连续区间 | 为 NVL send、RDMA partial 和最终输出划不重叠范围 |
+| `recv_src_meta` | 原始来源节点及 fan-out 位图 | 把 expert 输出映射回正确来源路径 |
+| `send_nvl_head` | dispatch 的 NVL queue 逻辑位置，未命中项可负编码 | combine 等待/读取对应 NVL 回程位置 |
+| `send_rdma_head` | dispatch 的 RDMA queue 逻辑位置 | combine 等待/读取对应 RDMA 回程位置 |
+
+cached dispatch 复用同一布局时可以省去 top-k 元数据重建，但 handle 的 token 数、路由、tensor 生命周期和所有 rank 的调用顺序必须保持匹配。它不是可任意跨 batch 使用的“通信句柄 ID”。
 
 ## 10. Python API 详解
 
@@ -670,6 +1077,112 @@ normal dispatch 的输出 token 数依赖远端路由。默认路径由 GPU 写 
 
 默认 config 是针对已知 EP rank 数的静态表，并非通用最优。仓库测试会遍历 config 并测量 `dispatch`、`notify`、`combine`，实际集群应按 GPU、NIC、拓扑、hidden 和 batch 调优。
 
+### 13.3 分层流量模型：先定义“算了哪些字节”
+
+**【源码可证】** normal dispatch 对同一目标 rank 去重：一个 token 即使命中该 rank 上多个 expert，hidden payload 只发送一次；跨节点又先按目标 RDMA rank（节点）计数，再由节点内 forwarder 送到最终 GPU。因此不能用简单的 `T × K × hidden_bytes` 同时代表 RDMA 与 NVLink 流量。
+
+令 `I_rank(t,r)` 表示 token `t` 是否至少命中 rank `r` 的一个 expert，`I_node(t,n)` 表示它是否至少命中节点 `n` 的一个 expert。只计 hidden/scale 的有效 payload 时，可写成：
+
+```text
+P_BF16(H) = 2H bytes
+P_FP8(H)  = H + 4(H/128) = H(1 + 1/32) bytes
+
+B_RDMA,dispatch ≈ Σ_t Σ_远端节点n I_node(t,n) · P(H)
+B_NVL,dispatch  ≈ Σ_t Σ_目标rank r I_rank(t,r) · P(H)
+```
+
+这只是理解数据面的第一阶模型，还需另外记录：
+
+- 每 token 的 `SourceMeta` 是两个 `int`，即 8 B；它与 18 个 `int`（72 B）的 channel 批次 metadata 不是同一个对象；
+- 可选 top-k index/weight、队列 padding、对齐和 tail/head 原子更新；
+- IB/NVLink 协议、WQE、链路编码等 wire overhead；
+- 本地目标、同节点目标和跨节点目标的占比。
+
+**【推导/调优假设】** 两级流水稳定后，数据 kernel 的下界可近似写成：
+
+```text
+T_data ≥ max(
+    B_RDMA / BW_RDMA,effective,
+    B_NVL  / BW_NVL,effective,
+    T_GPU_progress
+)
+```
+
+这里的 `T_GPU_progress` 包括 GPU 线程组装 WQE、轮询、TMA/LD-ST、metadata 解码与 combine 加法。实际端到端还包括 layout/notify、默认路径的 CPU exact-count 等待、张量分配和尾部排空：
+
+```text
+T_dispatch,e2e
+  = T_layout + T_notify + T_count_wait + T_alloc + T_data + T_drain
+```
+
+做计算通信重叠时，更关心可见时间而不是孤立 kernel 时间：
+
+```text
+T_visible ≈ T_issue/boundary + max(T_comm,in-flight, T_compute,overlap) + T_wait/consume
+```
+
+combine 不能直接复用 dispatch 的字节公式：它在节点内收集多个 expert/rank 的结果并做局部加法，跨 RDMA 域前可以把相同源 token 的贡献规约成较少的向量；最终 RDMA receiver 再完成跨节点累加。收益取决于路由重复度，必须由 handle 和实测 token 分布计算。
+
+### 13.4 官方 V1 数据的适用边界
+
+**【官方资料背景】** `docs/legacy.md` 报告的是一组特定 H800/CX7 实验：H800 节点内 NVLink 标称约 160 GB/s，每 GPU 连接一张 ConnectX-7 400 Gb/s NIC（约 50 GB/s）；工作负载是每 batch 4096 token、hidden 7168、top-4 groups、top-8 experts、FP8 dispatch、BF16 combine。原表将指标明确命名为 **bottleneck bandwidth**：
+
+| 路径 | EP | Dispatch | Combine |
+|---|---:|---:|---:|
+| Intranode | 8 | 153 GB/s（NVLink） | 158 GB/s（NVLink） |
+| Internode | 16 | 43 GB/s（RDMA） | 43 GB/s（RDMA） |
+| Internode | 32 | 58 GB/s（RDMA） | 57 GB/s（RDMA） |
+| Internode | 64 | 51 GB/s（RDMA） | 50 GB/s（RDMA） |
+
+这些数值不是 DeepEP API 的保证，也不是任何 H800/CX7 集群都会得到的普适值。它们受到路由分布、NIC 绑核/PCIe 拓扑、NVSHMEM/固件版本、`num_sms`、chunk 和频率状态影响。某些“有效 payload GB/s”可以因聚合口径而接近或超过单端口名义值，不能直接解释成原始链路 wire rate。
+
+**【源码可证】** legacy 测试中的带宽分子主要按 hidden 有效载荷计算：
+
+- internode BF16 dispatch 的 RDMA 字节数为“按目标节点去重后的发送 token 数 × hidden × 2”；
+- NVLink 字节数以 `recv_x.numel() × 2` 计；
+- FP8 使用 `(1 + 4/128) / 2` 乘 BF16 字节数，表示 1 B data 加每 128 元素 4 B scale；
+- 该分子没有完整计入 metadata、head/tail、WQE 和链路协议开销。
+
+> **禁止直接做 V1/V2 GB/s 归因。** V1 表名为 bottleneck bandwidth；V2 README 的表名为 logical bandwidth，并明确包含 local traffic。两边字节分子、V1 4096 与 V2 8192 token 配置、SM 数和实现都不同。若不先统一 token 路由、payload 定义、local-traffic 处理和计时边界，仅把两个表格的 GB/s 相减没有科学意义。
+
+### 13.5 可复现的实验工作流
+
+下面把“代码跑通”“微基准更快”和“训练 step 更快”分成三层，避免只调到一个漂亮的 kernel 数字。
+
+1. **冻结研究基线。** 记录 git commit、GPU/NIC/NVSwitch/PCIe 拓扑、CUDA/driver/NVSHMEM/固件、时钟和功耗策略、`NVSHMEM_*`/`EP_*` 环境变量、rank 到 GPU/NIC 的映射。
+2. **先验证正确性。** 使用 `tests/legacy/test_intranode.py` 或 `test_internode.py`，固定随机种子；检查 `recv_x`、local expert 计数、`topk_idx` 范围、combine 与 PyTorch 参考值。任何 timeout、NaN 或偶发错序都不能作为性能样本。
+3. **固定工作负载。** 报告 `T,H,K,E,R`、节点数、每节点 GPU 数、路由分布/负载不均衡、dtype、是否 cached dispatch、是否 expert alignment。建议同时保留均匀路由和真实门控 trace。
+4. **拆计时边界。** 分别测 layout、notify/count、data dispatch、combine；再测包含 CPU exact-count、分配和 event wait 的 API 端到端时间。通信-only 数字不能替代两 micro-batch overlap 的 step 时间。
+5. **遵循仓库基准默认值。** `deep_ep/utils/testing.py::bench` 默认 50 次 warmup + 50 次测量，每轮先写约 256 MB 张量冲刷 L2，最后丢弃第一个测量值，返回 average/min/max。`bench_kineto` 默认 `num_tests=30`，先额外调用一次 `fn()`，再用 Kineto 的 1 个 warmup period 和 1 个 active period 做两轮，每个 test 前同样可 flush L2。
+6. **一次改变一个因素，再做联合搜索。** 先 sweep 偶数 `num_sms`；再 sweep NVLink/RDMA chunk；随后测试 queue capacity、QP mapping/DCI 数。legacy internode 测试本身会遍历 dispatch 的 NVL chunk 4～44（步长 4）和 RDMA chunk 4～32（步长 4），可作为起点而非固定答案。
+7. **同时报告延迟和吞吐。** 至少给 average/min/max、建议增加 p50/p95/p99、有效 payload GB/s、GPU/NIC 利用率和 overlap 时 Attention/MoE 的 slowdown；同时保留 head-tail stall、timeout、HBM 占用和 CPU wait。
+8. **重复与交叉验证。** 每个点跨多个 seed/路由 trace 重复；打乱配置测试顺序，控制热状态；用 Nsight Systems 验证实际重叠，用 Nsight Compute 定位 GPU progress 瓶颈，用 NIC counter 区分 payload 指标与 wire traffic。
+9. **最终以端到端指标决策。** 在相同模型层、相同两个 micro-batch schedule 下比较 tokens/s 或 step time，并把准确率/数值误差、显存和计算 slowdown 一起纳入结论。
+
+建议每条实验结论使用如下记录模板：
+
+| 字段 | 示例 |
+|---|---|
+| 假设 | `num_sms=20` 比 16 更能打满 RDMA，但会增加 GEMM slowdown |
+| 控制变量 | 相同 commit、路由 trace、chunk、频率、rank/NIC mapping |
+| 自变量 | `num_sms ∈ {12,16,20,24}` |
+| 观测量 | data latency、API latency、RDMA/NVL payload GB/s、MoE slowdown、p95 |
+| 反证条件 | RDMA 利用率未升且 step time 变差，则“缺 SM”假设不成立 |
+
+### 13.6 从参数到现象的因果链
+
+**【推导/调优假设】**
+
+| 参数变化 | 直接机制 | 预期正面信号 | 过量时的反信号 |
+|---|---|---|---|
+| 增加 `num_sms` | channel 增多，sender/forwarder/receiver 并行度提高 | RDMA/NVL 利用率上升、queue stall 降低 | Attention/MoE 变慢、L2/HBM 竞争上升 |
+| 增大 send chunk | 每个 WQE/atomic 摊销更多 token | 消息率下降、有效带宽上升 | head-of-line blocking、尾延迟和 queue pressure 增大 |
+| 增大 recv capacity | credit 更宽松 | sender 等 head 的时间下降 | HBM 占用增加，缓存局部性可能下降 |
+| 增加/重映射 QP | 减少部分 warp 的提交冲突 | doorbell/WQE stall 下降 | QP/DCI 资源、fence/quiet 成本和状态内存上升 |
+| 改路由约束 | 改变 `I_node` 与 `I_rank` | 跨节点去重/局部规约率提高 | expert 负载不均衡或模型质量受影响 |
+
+NVSHMEM 官方也强调：IBGDA 由 GPU 直接提交网络操作，但 GPU 单线程填 WQE 的时延和“每线程独占 QP”的资源/同步成本之间存在权衡。这支持“QP 必须实测”的背景判断，却不能替代对 DeepEP 当前 QP/channel 映射的源码分析。
+
 ## 14. 正确性与风险点
 
 ### 14.1 有界队列复杂性
@@ -693,6 +1206,52 @@ V1 使用 queue 节省显存，但依赖所有 rank 一致进入通信、正确�
 
 legacy 内核可使用 `ld.global.nc.L1::no_allocate` 等激进读取方式。仓库说明其在 Hopper 上经过验证，但属于需谨慎对待的 PTX 行为。其他平台异常时可构建时设置 `DISABLE_AGGRESSIVE_PTX_INSTRS=1`。
 
+### 14.5 用 timeout 文案定位停滞边
+
+**【源码可证】** `LEGACY_NUM_TIMEOUT_CYCLES=200000000000`，源码注释约为 100 s。它是 watchdog 阈值而不是 SLA；实际墙钟时间受 GPU 时钟影响。日志中的第一个 timeout 通常比最后一串连锁 timeout 更接近根因。
+
+| 日志前缀 | 等待的边 | 优先检查 |
+|---|---|---|
+| `dispatch RDMA sender timeout` | sender 等目标 RDMA recv queue credit | 目标节点对应 channel 的 head 是否推进、RDMA chunk/capacity 约束、目标 rank 是否进入同一 collective |
+| `RDMA sender coordinator timeout` | coordinator 等 7 个 sender warp 完成 channel 区间 | 哪个 sender 的 completion window 未形成连续前缀、目标节点/QP 是否单独卡住 |
+| `dispatch forwarder timeout (RDMA meta)` | forwarder 等源节点发布 72 B channel metadata | 源 sender coordinator、tail atomic、QP 映射和 metadata 地址 |
+| `dispatch forwarder timeout (NVL check)` | forwarder 等目标 NVLink queue credit | 目标本地 GPU receiver 是否消费、IPC pointer 和 head/tail 是否一致 |
+| `dispatch forwarder timeout (RDMA check)` | forward coordinator 等所有目标 forward warp | 打印的 `src RDMA lane` 与目标 NVL；检查慢分支而非只看 coordinator |
+| `dispatch NVL receiver timeout` | receiver 等源节点/本地 GPU 的 NVL token 范围或 tail | `start/end` 与 SourceMeta bits、源 forwarder/sender 是否发布 |
+| `combine NVL sender timeout` | combine sender 等 forward queue credit | 目标 forward/reduce block 是否运行、handle 中 reverse prefix 是否一致 |
+| `combine forwarder (RDMA check) timeout` | forwarder 等目标 RDMA recv queue credit | 目标源节点 receiver 的 head、partial-reduction token 序列 |
+| `combine forwarder (NVL check) timeout` | forwarder 等节点内各 GPU 的贡献 | 哪个 `src NVL` 未发布、该 GPU 的 expert count/handle |
+| `combine RDMA receiver timeout` | 最终 receiver 等远端节点的规约结果 | 远端 forwarder、RDMA tail、waiting token/source node |
+
+### 14.6 由外到内的死锁/错序调试流程
+
+1. **全局调用一致性。** 为每次 layout/dispatch/combine 生成单调 collective sequence id，所有 rank 打印 `(seq, op, shape, config, handle-id)`；先确认不是某个 rank 少调用、异常退出或使用了不同 handle。
+2. **拓扑和初始化。** 核对 `num_rdma_ranks × num_nvl_ranks = world_size`、同号本地 GPU 是否组成 RDMA 域、IPC handle 是否全部打开、NIC/GPU 亲和性和 NVSHMEM PE/rank 映射。
+3. **队列四元组。** 对日志给出的 `(rank, channel, peer)` 同时采集 producer tail、consumer head、capacity：
+   - tail 不动：上游未生成/未发布；
+   - tail 动而 head 不动：消费者未运行、地址/metadata 错或 acquire 未见；
+   - `tail-head≈capacity`：credit/backpressure；
+   - head 越过 tail：计数或生命周期被破坏。
+4. **按公式还原执行者。** `channel=blockIdx.x/2`；internode dispatch 偶 block 的 forward warp 目标为 `(warp_id+channel)%8`，奇 block 的 receiver 源为 `(warp_id+channel-7)%8`；sender warp 为 `(token-channel_start)%7`。不要凭物理 SM 编号猜线程角色。
+5. **缩小到单通道/小形状。** 用最小 `T,H,K`、均匀路由和较大 queue 复现，再逐步恢复真实路由；保留同一 seed。若只在 wrap-around 出现，重点查 absolute head/tail 与 slot modulo。
+6. **验证发布协议。** 检查 payload/metadata put 与 tail atomic 是否仍使用预期 channel/QP，release/acquire/fence 是否保留。NVSHMEM 官方区分 `fence` 的顺序保证与 `quiet` 的完成保证；不能把“某次测试可见”当作跨 QP 的规范保证。
+7. **工具分层。** 先打开 NVSHMEM 的 INFO/DEBUG 和项目 NVTX；用 Nsight Systems 看 rank/kernel/QP 时间线，用 Compute Sanitizer 查越界/竞态，用 Nsight Compute 看常驻 block 与 memory stall。`EP_USE_NVIDIA_TOOLS=1` 时仓库会跳过 Kineto 路径，避免 profiler 相互冲突。
+8. **最小化激进读取变量。** 若只在非 Hopper、特定编译器或 sanitizer 下异常，使用 `DISABLE_AGGRESSIVE_PTX_INSTRS=1` 重编译做 A/B；这只能定位因素，不能自动证明原实现没有内存序问题。
+9. **核对异步生命周期。** 使用 `async_finish=True` 时，在首个消费者前等待返回 event；若 `allocate_on_comm_stream=True`，确保 tensor 在 event 完成前没有被回收或在错误 stream 复用。
+
+### 14.7 数值正确但“token 对不上”的排查表
+
+| 症状 | 首查对象 | 原因 |
+|---|---|---|
+| `recv_topk_idx` 出现越界或本地 expert 数不符 | global→local expert 映射、`-1` 无效项、expert prefix | hidden 可能到达了正确 rank，但 expert slot 错 |
+| 仅 FP8 错，BF16 正常 | scale 的 token-major stride、`H/128`、data/scale queue offset | data 与 scale 是并行 payload，任一偏移错误都会造成系统性数值偏差 |
+| dispatch 正确、combine 少加/多加 | handle 的 rank/RDMA prefix、SourceMeta、reverse token index | combine 依赖 dispatch 保存的路由日志，不会重新调用 gating |
+| `combined_x` 正确但 combined weight 错 | weight buffer/stride 与可选参数路径 | normal combine 分别累加 x 与传入 weight，不在 kernel 内做 `x×weight` |
+| cached dispatch 首次正确、复用后错 | token 数/路由是否与 handle 的 cached layout 完全一致 | cached handle 不是任意新 routing 的模板 |
+| 只在 overlap 时错 | `previous_event`、返回 event、stream ownership | 多为依赖或 tensor 生命周期，而不是路由算法本身 |
+
+**【推导/调优假设】** 调试时应把“首个错误 token”映射为 `(source rank, source token, channel, sender warp, destination node, destination local GPU, queue absolute index)`。这个唯一轨迹比打印整个 tensor 更容易把数值错定位到某一级 metadata 或队列。
+
 ## 15. 关键函数逐段阅读建议
 
 建议按以下顺序读代码：
@@ -707,6 +1266,51 @@ legacy 内核可使用 `ld.global.nc.L1::no_allocate` 等激进读取方式。�
 8. [`intranode::combine`](../csrc/kernels/legacy/intranode.cu#L706) 与 [`internode::combine`](../csrc/kernels/legacy/internode.cu#L1721)：看回传和规约。
 9. [`Config`](../csrc/legacy/config.hpp)：把代码中的所有 buffer offset 与 size hint 对上。
 
-## 16. 一句话总结
+## 16. 研究依据与参考资料
+
+本文采用“当前 commit 源码为实现事实、项目/硬件官方资料为语义背景、性能模型必须实验反证”的证据顺序。外部 NVIDIA 文档会随版本更新，解释的是 API/硬件模型；实际 bundled NVSHMEM 与本 commit 的具体行为仍需结合构建版本验证。
+
+### 16.1 本地源码证据索引
+
+| 证据 | 用途/能证明什么 |
+|---|---|
+| [`internode.cu`](../csrc/kernels/legacy/internode.cu) | 两 block/channel、warp 角色、token 分片、72 B metadata、dispatch/combine 队列与 timeout |
+| [`intranode.cu`](../csrc/kernels/legacy/intranode.cu) | 单节点 sender/receiver、TMA 和 combine 规约 |
+| [`buffer.cuh`](../csrc/kernels/legacy/buffer.cuh) | `SymBuffer/AsymBuffer` 分区、head/tail/queue 地址计算 |
+| [`ibgda_device.cuh`](../csrc/kernels/legacy/ibgda_device.cuh) | GPU 填 WQE、registration chunk 拆分、QP/doorbell/atomic |
+| [`utils.cuh`](../csrc/kernels/legacy/utils.cuh) | system-scope release/acquire/fence、激进 PTX 与 TMA helper |
+| [`buffer.hpp`](../csrc/legacy/buffer.hpp) 与 [`legacy.py`](../deep_ep/buffers/legacy.py) | Python→C++→kernel 参数、CPU exact-count、handle、stream/event |
+| [`testing.py`](../deep_ep/utils/testing.py) 与 [legacy tests](../tests/legacy) | 50/50 benchmark、256 MB L2 flush、Kineto 默认值、正确性与带宽分子 |
+| [`legacy.md`](legacy.md) | V1 官方配置、H800/CX7 特定性能表、normal/low-latency 使用边界 |
+
+### 16.2 外部一手资料
+
+以下链接访问日期均为 **2026-08-26**。
+
+| 一手资料 | 用途/能证明什么 | 访问日期 |
+|---|---|---|
+| [DeepEP V1 legacy 文档（上游源码基线）](https://github.com/deepseek-ai/DeepEP/blob/01dc3aaac82068020353dce2c302e38153c0bfaa/docs/legacy.md) | V1 normal 定位、特定 H800/CX7 测试条件、bottleneck bandwidth 原表、与论文可能有差异的边界 | 2026-08-26 |
+| [DeepEP `internode.cu`（上游源码基线）](https://github.com/deepseek-ai/DeepEP/blob/01dc3aaac82068020353dce2c302e38153c0bfaa/csrc/kernels/legacy/internode.cu) | 让文中 block/warp/queue/metadata/combine 结论可从固定版本复核 | 2026-08-26 |
+| [DeepEP legacy kernel 目录（上游源码基线）](https://github.com/deepseek-ai/DeepEP/tree/01dc3aaac82068020353dce2c302e38153c0bfaa/csrc/kernels/legacy) | symmetric/asymmetric buffer 布局、其余 legacy kernel 的固定版本入口 | 2026-08-26 |
+| [DeepEP 当前官方 README](https://github.com/deepseek-ai/DeepEP/blob/main/README.md) | V1/V2 文档入口及 V2 指标口径背景；不能反向覆盖固定 V1 commit 的源码事实 | 2026-08-26 |
+| [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) | `3.2.2` 的两级 IB→同号 GPU→NVLink 路径、20 SM/10 channel、warp specialization、custom PTX/chunk autotune；`2.1.2` 的 node-limited routing 背景 | 2026-08-26 |
+| [NVSHMEM: Using NVSHMEM](https://docs.nvidia.com/nvshmem/api/latest/using.html) | symmetric heap 是各 PE 的对称分配，以 `<symmetric address, PE>` 定位；IBGDA/GDAKI 可由 GPU 承担网络控制面和数据面 | 2026-08-26 |
+| [NVSHMEM API Overview](https://docs.nvidia.com/nvshmem/api/latest/api/overview.html) | `fence`/`quiet`/barrier 的作用范围与完成/可见性边界，CPU/GPU 发出者不能混为一谈 | 2026-08-26 |
+| [NVSHMEM IBGDA Performance Guide](https://docs.nvidia.com/nvshmem/release-notes-install-guide/best-practice-guide/performance.html) | QP/DCI 数、资源、GPU WQE 提交和同步开销之间的官方调优背景 | 2026-08-26 |
+| [CUDA Programming Guide: Advanced Kernel Programming](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html) | system-scope acquire/release 与 async/TMA proxy synchronization 的官方语义背景 | 2026-08-26 |
+| [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/) | `ld.global.nc`、cache operator 和 scope/semantics 修饰符的规范入口 | 2026-08-26 |
+
+## 17. 本地扩展阅读
+
+- [V1 通信源码深潜（恢复版）](../DeepEP_V1_Communication_DeepDive_Restored_CN.md)：补充 buffer offset、消息协议和逐函数追踪。
+- [V1 Normal 的 SM/Warp/Thread 深潜](../DeepEP_V1_Normal_SM_Warp_Thread_DeepDive.md)：集中展开 block、warp、lane 的角色映射。
+
+这两份资料是基于同一 commit 的解释稿，适合交叉阅读和建立心智模型，**不是独立于源码的新证据**；若其中表述与固定 commit 冲突，应回到对应 kernel 和断言。
+
+## 18. 总结与文档导航
 
 V1 SM 方案的本质是：**用若干通信 SM 驱动分通道有界队列，单机直接写 NVLink IPC buffer，多机通过“同号 GPU 的 IBGDA RDMA + 节点内 NVLink 转发”完成层次化 All-to-All，并用 dispatch handle 保存 combine 的逆向路由。** 它以较复杂的队列、显式 SM 配置和部分 CPU 同步换取大批量场景的高带宽。
+
+- 关注 decode、小 batch、纯 RDMA 与 receive hook：继续阅读 [V1 Low-Latency 实现](implementation-v1-low-latency.md)。
+- 关注 JIT、ElasticBuffer、新 topology/layout 与 V2 指标口径：继续阅读 [V2 Elastic 实现](implementation-v2-elastic.md)。
+- 回看两种 V1 策略在经典双 micro-batch 图中的对应关系：见 [1.1 节](#11-经典双-micro-batch-重叠图)。

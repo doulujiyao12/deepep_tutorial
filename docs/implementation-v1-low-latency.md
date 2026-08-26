@@ -2,6 +2,43 @@
 
 > 本文对应仓库中的 V1 legacy `low_latency_dispatch` / `low_latency_combine` 路径。它面向推理解码阶段的小 batch，使用 NVSHMEM IBGDA、固定上界缓冲、expert-major 输出和可拆分的 send/recv phase，追求端到端微秒级延迟及通信与计算重叠。
 
+## 0. 研究范围、基线与证据等级
+
+本文采用“双基线”，避免把教程提交误当成 DeepEP 上游源码提交：
+
+| 基线 | commit / 日期 | 适用范围 |
+|---|---|---|
+| **本地文档基线** | `f99f06868616c6fa96f83ff1caa5f0231f9ee3bc`（2026-08-25） | 教程提交 `Add DeepEP implementation tutorials`，仅新增三篇 implementation 文档；决定本文解释稿的版本 |
+| **上游源码基线** | `01dc3aaac82068020353dce2c302e38153c0bfaa`（2026-08-04，`origin/main`） | `f99f068...` 的父提交；本文所有 C++/CUDA/Python、测试和布局事实以此源码树为准 |
+
+V1 已处于 legacy 路径；后续版本可能改变环境变量、内核布局或公开 API，因此复现实验时必须同时记录本地文档基线和上游源码基线。
+
+文中的结论分为三类：
+
+| 标签 | 含义 | 典型证据 |
+|---|---|---|
+| **源码可证** | 可由上游源码基线 `01dc3aaa...` 的 C++/CUDA/Python 与测试直接确认 | 结构体布局、地址公式、phase 位、断言、kernel 分支 |
+| **官方资料背景** | NVIDIA/DeepSeek 的官方文档或论文定义的机制/部署背景 | NVSHMEM 对称堆与排序语义、IBGDA 数据路径、DeepSeek-V3 解码部署 |
+| **推导/调优假设** | 由源码组合得到的协议解释，或需要在目标机器上实验验证的性能判断 | 同 QP payload→flag 的完成协议、最佳 QP 数、重叠收益边界 |
+
+特别注意：本文不会把“某个 flag 已可见”泛化成任意 RDMA 写都已全局可见。第 3.4 节会分别说明 NVSHMEM 公共 API 的保证，以及 DeepEP 直接构造 IBGDA WQE 后由源码推导出的内部约束。
+
+### 0.1 为什么这条路径专门面向 decode
+
+**官方资料背景：** DeepSeek-V3 技术报告描述的解码部署使用 EP320、每张 GPU 放置一个冗余或路由 expert，并让 dispatch/combine 直接走 IB 点到点通信与 IBGDA；报告同时指出单 expert 的解码 batch 通常不超过 256，并采用两个 micro-batch，把一个 batch 的 Attention 与另一个 batch 的 dispatch、MoE、combine 重叠。这个“小消息、高频、需要让出 SM”的约束正是 low-latency 路径的设计背景。
+
+但需保留两个边界：
+
+1. 报告描述的是 DeepSeek-V3 线上部署；本仓库 V1 实现的 expert 数、拓扑和调度细节可以不同。
+2. decode 的双 micro-batch overlap 与 prefill/训练的通信-计算重叠不是同一个调度问题，不能只凭吞吐 benchmark 推断端到端 token latency。
+
+### 0.2 本地扩展阅读
+
+- [`DeepEP_LowLatency_IBGDA_DeepDive.md`](../DeepEP_LowLatency_IBGDA_DeepDive.md)：聚焦 IBGDA、WQE、QP 和 low-latency 内核细节。
+- [`DeepEP_V1_Communication_DeepDive_Restored_CN.md`](../DeepEP_V1_Communication_DeepDive_Restored_CN.md)：横向解释 V1 normal 与 low-latency 通信体系。
+
+两篇与本文同属本地文档基线 `f99f068...`，解释对象是其父提交、上游源码基线 `01dc3aaa...`；它们适合作为阅读导航，发生冲突时应以该上游源码树、测试和官方语义为准。
+
 ## 1. 与 V1 normal/SM 方案的区别
 
 | 维度 | V1 normal / SM | V1 low-latency |
@@ -213,6 +250,113 @@ buffer = deep_ep.Buffer(
 
 `Buffer.__init__` 在 low-latency 模式中以全局 rank 作为 NVSHMEM PE，而 normal 跨节点模式只以 `rdma_rank` 作为 PE。这使 low-latency 能直接面向整个 EP group 发起通信。
 
+### 3.2 从对称堆到 NIC 注册内存
+
+**官方资料背景：** NVSHMEM 采用 SPMD PE 模型。所有 PE 必须以相同顺序、相同大小参加对称分配；返回地址在本 PE 上是普通 CUDA 指针，而远端寻址逻辑是“本地对称地址在 heap 中的 offset + 目标 PE 的 heap base”。所以“对称”指跨 PE 可由同一 offset 定位，并不要求不同进程的数值虚拟地址完全相同。
+
+**源码可证：** low-latency 的初始化链路是：
+
+```mermaid
+flowchart TD
+    A[各 rank 计算同一个 RDMA size hint] --> B[设置 NVSHMEM/IBGDA 环境]
+    B --> C[nvshmem_align 分配 symmetric heap 区域]
+    C --> D[NVSHMEM 建立 PE、QP 与远端 heap/key 表]
+    D --> E[DeepEP 将 rdma_buffer 全部置零]
+    E --> F[全 PE barrier]
+    F --> G[LowLatencyLayout 在该区域切分 ping/pong]
+```
+
+Python 初始化在 NVSHMEM bootstrap 之前设置的关键项包括：
+
+| 配置 | 当前 V1 代码中的作用 |
+|---|---|
+| `NVSHMEM_IB_ENABLE_IBGDA=1` | 选择 GPU 发起的 IBGDA transport |
+| `NVSHMEM_IBGDA_NUM_RC_PER_PE=num_qps_per_rank` | 为每个对端 PE 建立多条 RC QP；推荐值等于 local expert 数 |
+| `NVSHMEM_QP_DEPTH` | 设置 legacy 路径期望的 QP 深度；Python 侧检查至少 `(M+1)*2` |
+| `NVSHMEM_DISABLE_P2P` | 控制是否允许节点内 P2P bypass |
+| `NVSHMEM_IBGDA_NIC_HANDLER=gpu`、`NVSHMEM_DISABLE_NVLS=1` | 固定当前 V1 使用的 NIC handler/collective 路径 |
+| `NVSHMEM_CUMEM_GRANULARITY=2^29` | 控制对称堆的 cuMem 分配粒度 |
+
+这里有三个容易混淆的概念：
+
+1. **CUDA 可访问**不等于**NIC 可 RDMA**。NVSHMEM transport 还要把 heap backing memory 注册给 HCA，并向设备侧状态提供 local/remote key。
+2. 常规 `torch.empty` 输出并未因此自动成为 DeepEP 的 RDMA 源/目的；真正的网络 send/recv 区是 `rdma_buffer` 中的对称分配。zero-copy combine 之所以成立，正因为它返回的是这块已注册区域上的视图。
+3. 节点内存在可用 P2P 指针时，内核可直接做 GPU copy；否则才走 IBGDA。两条路径的性能资源冲突不同，必须按真实拓扑分别测量。
+
+### 3.3 GPU 如何构造 WQE：QP、lkey 与 rkey
+
+**官方资料背景：** IBGDA 把传统 CPU verbs 路径中的“构造 work request、更新队列、敲 doorbell”下沉到 GPU。GPU 线程把 WQE 写进位于 GPU 内存的 QP work queue，更新 doorbell record/doorbell 后，HCA 直接 DMA 读取源 GPU 内存并在远端执行写入或原子操作。
+
+**源码可证：** `legacy/ibgda_device.cuh` 是从 NVSHMEM device transport 派生并修改的实现。一次 `nvshmemi_ibgda_put_nbi_warp` 可展开为：
+
+```mermaid
+sequenceDiagram
+    participant W as CUDA warp
+    participant SQ as RC QP send queue
+    participant NIC as HCA/NIC
+    participant R as remote symmetric heap
+    W->>SQ: 原子预留 WQE slot
+    W->>W: 由 heap offset 查 local/remote registration chunk
+    W->>SQ: 填 ctrl、raddr/rkey、data/laddr/lkey/bytes
+    W->>SQ: __threadfence 后推进 ready_head
+    W->>NIC: 更新 doorbell record/doorbell
+    NIC->>NIC: DMA 读取本地 GPU payload
+    NIC->>R: RDMA WRITE 或 atomic
+    NIC-->>SQ: 写 completion queue entry
+```
+
+WQE 中两个 key 的职责不同：
+
+- `lkey` 授权 HCA 读取本地 source address；
+- `rkey` 授权远端 HCA 写入/原子访问目标地址；
+- `raddr` 不是直接照抄本地指针，而是由对称 heap offset 加目标 PE 的 remote base 得到。
+
+NVSHMEM 的 heap 可能按 registration chunk 注册。当前 put helper 同时检查本地与远端 chunk 边界，把跨界的一个逻辑消息拆成若干 WQE，每段各自携带正确的 `lkey/rkey`；源码注释指出理论上通常不超过三段，但实现仍以边界计算结果为准。由此可见，固定 72 字节或任意单一 metadata 大小都不能被当作通用的 WQE/注册粒度保证。
+
+RC QP 由 `ibgda_get_rc(pe, id)` 选择，`id` 会映射到该对端可用的 RC QP 集合。DeepEP dispatch 把目标 `dst_local_expert_idx` 作为 QP id，combine 把发送方 `local_expert_idx` 作为 QP id；这解释了“每个 local expert 一条 QP”的源码意图。QP 太少会增加热点和串行化，QP 太多则增加设备状态、队列内存和 NIC 资源压力，**最佳值是需要在目标 HCA、EP 规模和路由偏斜上验证的调优假设**。
+
+WQE 发布还有两个层次：
+
+- `__threadfence()` 让当前 GPU 写出的 WQE 描述符在推进 ready head/doorbell 前可见；它不是“远端 payload 已完成”的证明。
+- `put_nbi` 返回只说明请求已构造/发布到传输路径，不说明远端数据已经到达。CQ producer index/`quiet` 才参与本地执行上下文的完成确认，但 DeepEP 热路径主要用后续 count/flag 协议避免每条消息做 `quiet`。
+
+### 3.4 payload、count/flag 与完成顺序
+
+先给出 NVSHMEM 的**公共语义边界**：
+
+| 操作 | 官方语义的安全表述 |
+|---|---|
+| 非阻塞 RMA（NBI） | 调用返回时操作可以仍在途；使用前必须通过适当的同步/完成操作建立依赖 |
+| `nvshmem_fence` | 排序本 PE 之前与之后发往目标 PE 的更新，但它本身不是所有操作均已完成的等待 |
+| `nvshmem_quiet` | 等待调用 PE 当前执行上下文中此前发起的相关 NBI 更新完成 |
+| `put-with-signal` | 对同一 API 操作，接收端观察到 signal 完成可作为其关联数据已交付的通知 |
+| 独立 signal/另一条 QP | 不能不加证明地推断它替任意先前 transfer 提供排序；跨 QP 操作本来就是独立的 |
+
+DeepEP 热路径**没有简单调用公共 `nvshmem_put_signal`**，而是直接构造 put WQE 与后续 atomic WQE。因此下面的结论属于“源码可证的局部事实 + 协议推导”，不是可移植到任意 NVSHMEM 程序的保证。
+
+Dispatch 的发送完成协议为：
+
+```mermaid
+flowchart LR
+    A[各数据 warp: payload put<br/>QP id = dst_local_expert] --> B[本地 finish counter<br/>release/acquire 汇合]
+    B --> C[计数 warp: count AMO<br/>同一 dst_local_expert QP]
+    C --> D[远端 system-acquire 轮询 count]
+    D --> E[解码 count 并复制 payload]
+```
+
+- 本地 `atomic_finish_counter` 只协调同一 kernel 中的 warp，证明负责该 expert 的 payload put 已被构造/提交；它不等于网络完成。
+- 随后的 count AMO 使用与 payload 相同的 `dst_local_expert_idx` QP。内部 QP 的 ready-head 串行发布机制和 RC QP 顺序是接收端把 count 当作到达标志的协议基础。
+- count 编码为 `-num_tokens_sent-1`：即使发送 0 个 token，也会写 `-1`；初值 `0` 因而唯一表示“尚未收到完成计数”。接收端取反解码后才得到真实数量。
+
+Combine 同理：某个 local expert 的 payload put 全部使用 `local_expert_idx` QP，warp 汇合后再在同一 QP 上用 atomic 写对应 flag；源 rank 以 system-scope acquire load 等待按 global expert 编号的 flag，随后再读取消息并规约。
+
+这套设计要求长期保持以下不变量：
+
+1. 同一逻辑 payload 与其 count/flag 必须留在协议证明覆盖的同一 QP 序列上；
+2. 下一轮复用 signal 与 data slot 之前，上一轮消费与清理必须完成；
+3. 若未来把 payload 条带化到不同 QP、改成另一类 transport，必须重新引入有官方语义支撑的 fence/quiet/put-with-signal 或等价完成协议，不能只保留一个 atomic flag；
+4. 接收端的 acquire load 负责观察通知并约束后续 GPU 读取，但“flag 代表哪些 payload”仍由前述发送顺序定义。
+
 ## 4. 固定消息与双缓冲布局
 
 ### 4.1 为什么采用固定容量
@@ -225,55 +369,100 @@ buffer = deep_ep.Buffer(
 
 真实有效数量由 GPU 张量 `packed_recv_count[local_expert]` 给出。
 
-### 4.2 `LowLatencyLayout`
+### 4.2 `LowLatencyLayout` 的真实物理顺序
 
-[`LowLatencyLayout`](../csrc/legacy/config.hpp) 在同一块 NVSHMEM symmetric buffer 中放置两套 buffer：
+设：
 
-```mermaid
-flowchart LR
-    subgraph B0[Buffer 0 / ping]
-      S0[send buffer] --> R0[recv data buffer] --> F0[signal/count buffer]
-    end
-    subgraph B1[Buffer 1 / pong]
-      S1[send buffer] --> R1[recv data buffer] --> F1[signal/count buffer]
-    end
+```text
+R = num_ranks
+E = num_experts
+L = E / R                         # 每 rank local experts
+M = num_max_dispatch_tokens_per_rank
+H = hidden
+A128(x) = x 按 128 B 对齐
 ```
 
-每次 dispatch/combine 都执行：
+[`LowLatencyLayout`](../csrc/legacy/config.hpp) 在同一块 NVSHMEM symmetric buffer 中构造两个逻辑 slot，但物理顺序不是“一个完整 ping 后接一个完整 pong”，而是同类区域成对排列：
+
+```text
+| signal/count 0 | signal/count 1 |
+| send data 0    | send data 1    |
+| recv data 0    | recv data 1    |
+```
+
+每个 `LowLatencyBuffer` 只是把对应 slot 的三段指针组装起来；同一 data 区又被 dispatch 与 combine 以不同消息类型别名解释。因此，dispatch 与 combine 的容量取二者最大值，而不是各自再分配一整套物理内存。
+
+```mermaid
+flowchart TD
+    X[symmetric rdma_buffer] --> S[2 x aligned signal regions]
+    S --> TX[2 x max dispatch/combine send regions]
+    TX --> RX[2 x max dispatch/combine recv regions]
+    RX --> B0[LowLatencyBuffer 0: signal0/send0/recv0]
+    RX --> B1[LowLatencyBuffer 1: signal1/send1/recv1]
+```
+
+### 4.3 精确消息与容量公式
+
+Dispatch 单条槽位的保守大小为：
+
+```text
+Dmsg = sizeof(int4) + max(
+    H * sizeof(bfloat16),              # BF16 payload
+    H * sizeof(fp8) + (H/128)*4        # FP8 payload + FP32 scale 上界
+)
+     = 16 + max(2H, H + H/128*4)
+```
+
+其中 `int4` 保存 source token index 等控制字段；FP8 scale 的逻辑粒度是每 128 hidden 元素一组。`use_ue8m0` 可压缩实际 scale 表示，但布局 size hint 仍按上述安全上界计算。
+
+Combine 单条槽位容量为：
+
+```text
+Cmsg = H * sizeof(bfloat16)
+     + (H/128) * sizeof(nv_bfloat162)
+     = 2H + (H/128)*4
+```
+
+每个 128 元素分组都预留一个 `nv_bfloat162`，保存 LogFMT 判断/解码所需的两个 BF16 元数据。物理 payload 区仍按 BF16 上界分配，启用 LogFMT 时才让部分分组在其中使用 10-bit packed 表示。
+
+该 commit 中每个 slot 的概念容量为：
+
+```text
+send_bytes = max(M * Dmsg, E * M * Cmsg)
+recv_bytes = max(E * M * Dmsg, E * M * Cmsg)
+signal_bytes = A128(E * sizeof(int))
+```
+
+总 size hint 再容纳两份 signal、send、recv 并按 legacy alignment 对齐。显存随 `E*M*H` 近似线性增长；因此把 `M` 盲目设成远大于真实 decode batch 的值，会同时扩大 registered heap、QP 在途上界和 cache/HBM 足迹。
+
+### 4.4 ping-pong 是“按 API 调用翻转”，不是任意两轮缓存
+
+每次 `low_latency_dispatch` 或 `low_latency_combine` 进入 C++ 都执行：
 
 ```cpp
 auto buffer = layout.buffers[low_latency_buffer_idx];
 auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+auto next_clean_meta = next_buffer.clean_meta();
 ```
 
-当前操作使用一套，下一套的 signal 区在本轮末尾清理。这样相邻调用交替使用，减少全局清零落在关键路径上，但也带来重要限制：**同一时刻最多安全持有两轮 low-latency 返回结果**。
+当前调用使用 `buffer`，同时在其 SEND phase 清理 `next_buffer` 的 signal/count，为下一次 low-latency API 调用做准备。翻转单位是**一次 dispatch/combine API 调用**，不是“一个完整 micro-batch”。典型双 micro-batch 的安全序列如下：
 
-### 4.3 消息大小
+| 顺序 | 动作 | 当前 data slot | SEND 顺带清理 | 必须已满足 |
+|---:|---|---:|---:|---|
+| 1 | Dispatch A SEND | 0 | signal 1 | 初始两组 signal 为 0 |
+| 2 | Dispatch A RECV hook | 0 | — | 消费 slot 0 的 count/payload |
+| 3 | Dispatch B SEND | 1 | signal 0 | A 的 RECV 已不再依赖 signal 0 |
+| 4 | Dispatch B RECV hook | 1 | — | 消费 slot 1 |
+| 5 | Combine A SEND | 0 | signal 1 | A dispatch 数据已搬到独立输出，B 的 RECV 已完成 |
+| 6 | Combine A RECV hook | 0 | — | 规约 A 返回值 |
+| 7 | Combine B SEND | 1 | signal 0 | A combine RECV 已完成 |
+| 8 | Combine B RECV hook | 1 | — | 规约 B 返回值 |
 
-dispatch 消息包含：
+实际经典图会把步骤 2/3、4/5、6/7 各压缩在同一个边界附近，并在边界之间插入 Attention/MoE。表格强调的是依赖顺序，不要求 CPU 阻塞；同一 CUDA stream 的 enqueue 顺序或显式 event 可以建立这些依赖。
 
-```text
-int4 control/source area
-+ max(
-    BF16 hidden bytes,
-    FP8 hidden bytes + FP32/UE8M0 scales
-  )
-```
+需要据此修正一句常见但过宽的说法：**双缓冲并不等价于“任意两个未完成结果都能安全长期持有”。** 正确规则是：下一次调用清理另一 slot 的 signal，某 slot 再次成为当前 slot 前，其旧 RECV 必须完成；hook 捕获的输入、输出、handle 和 layout 也必须存活。普通 `recv_x`/`combined_x` 是另行分配的输出张量，不能一概说成 RDMA buffer 视图；真正明确别名 registered send buffer 的是 zero-copy combine view。
 
-combine 消息包含：
-
-```text
-per-128-channel scale/min-max area
-+ BF16 hidden bytes
-```
-
-两类消息共享 send/recv 物理区域，实际分配取 dispatch 和 combine 需求的最大值。整个布局含：
-
-- 2 个 symmetric send buffer；
-- 2 个 symmetric recv data buffer；
-- 2 个按 128 字节对齐的 count/flag buffer。
-
-size hint 最终按 legacy buffer alignment 向上对齐。
+若使用 CUDA Graph，固定形状有利于 capture，但 buffer 指针和 host 侧 ping-pong index 在 capture 时已选定。生产代码应把 capture/replay 当作一个完整协议单元验证，避免与 eager 调用交叉后仅凭“有两个 slot”推断状态仍正确。
 
 ## 5. Low-Latency Dispatch 原理
 
@@ -440,7 +629,7 @@ combine 根据 `layout_range[local_expert, src_rank]` 找到 dispatch 时由某�
 1. 读取本地 expert GEMM 输出；
 2. 根据 `src_info` 恢复源 token index；
 3. 将返回消息写入源 rank 对称 recv buffer；
-4. 可用 BF16 直接发送，也可使用内部 `LogFMT`（动态 per-64-channel cast 的 10-bit 格式）降低 payload；
+4. 可用 BF16 直接发送，也可按 **每 128 个 hidden 元素**动态选择内部 10-bit `LogFMT` 或 BF16 fallback；
 5. 数据可见后写 flag，通知源 rank 某段结果到达。
 
 ### 6.3 RECV phase 与加权规约
@@ -463,78 +652,175 @@ flowchart LR
     F --> G[combined_x]
 ```
 
-## 7. Send/Recv Phase 与 Hook
+### 6.4 LogFMT：固定容量中的动态混合编码
 
-### 7.1 phase 位
-
-底层内核接收 `phases` bitmask：
-
-```text
-LEGACY_LOW_LATENCY_SEND_PHASE
-LEGACY_LOW_LATENCY_RECV_PHASE
-```
-
-普通模式一次 launch 同时包含二者。`return_recv_hook=True` 时：
-
-1. 首次 launch 仅执行 SEND；
-2. C++ 返回 Python callable；
-3. 用户调用 hook 后，再次 launch 同一内核但只执行 RECV。
-
-### 7.2 为什么 hook 能释放计算 SM
-
-SEND phase 只负责把 RDMA work request 发给 NIC。请求发出后，数据传输由 NIC/DMA 在后台进行；此时不需要持续占用 GPU SM。用户可在网络传输期间启动另一个 micro-batch 的 attention 或 MoE GEMM，直到真正需要结果时调用 RECV hook。
-
-### 7.3 双 micro-batch overlap
+**源码可证：** 当前 kernel 以 `H/128` 个 division 处理 combine 消息，而不是某些 Python docstring 中写的 per-64。每个 128 元素 division 始终有一个 `nv_bfloat162`（4 B）元数据槽，并根据该组数值的对数范围选择：
 
 ```mermaid
-gantt
-    title 双 batch 低时延流水示意
-    dateFormat X
-    axisFormat %L
-    section Batch A
-    Attention A      :a1, 0, 3
-    Dispatch SEND A  :a2, 3, 1
-    RDMA in background A :a3, 4, 4
-    Dispatch RECV A  :a4, 8, 1
-    MoE A            :a5, 9, 4
-    Combine SEND A   :a6, 13, 1
-    Combine RECV A   :a7, 17, 1
-    section Batch B
-    Attention B      :b1, 4, 3
-    Dispatch SEND B  :b2, 7, 1
-    Dispatch RECV B  :b3, 11, 1
-    MoE B            :b4, 12, 4
+flowchart TD
+    A[读取 128 个 BF16] --> B[统计 log_amax/log_amin]
+    B --> C{满足 LogFMT 编码条件?}
+    C -- 是 --> D[每值: sign + 9-bit magnitude]
+    D --> E[128 x 10 bit = 160 B]
+    C -- 否 --> F[保留 128 x BF16 = 256 B]
+    E --> G[写 4 B division metadata]
+    F --> G
 ```
 
-真实 stage 长度应按模型测量调整。hook 模式的约束：
+源码分支要求 `log_amax < 0` 且 `log_amin < log_amax`，并把可表示的最小对数范围限制在 32 以内；不满足时该 division 保留 BF16。接收端从 metadata 判断同一 division 应走 10-bit 解码还是 BF16 load。也就是说：
 
-- `return_recv_hook=True` 与 `async_finish=True` 不能同时使用；
-- hook 模式在当前/default compute stream 上启动，调用方负责排好依赖；
-- hook 必须调用，否则返回张量尚未真正接收完成；
-- 若允许本地 NVLink/P2P bypass，某些本地复制仍可能与计算资源发生竞争，仓库注释提示它与纯 hook overlap 并非完全兼容。
+- LogFMT 是 DeepEP 内部 wire format，不是一个可由普通 GEMM 直接产生的标准 dtype；
+- 压缩选择是**逐 128 元素组动态发生**，一条消息可混合压缩组与 BF16 fallback 组；
+- 理想编码组把 payload 从 256 B 降到 160 B，另加固定 4 B metadata，即仅按元素位宽计算是 BF16 的 `10/16`；
+- 固定 buffer 仍按最坏 BF16 容量分配，所以它节省网络实际发送字节，不直接缩小 `LowLatencyLayout` 的显存上界。
+
+测试中的 LogFMT 带宽记账使用近似 `H*10/8 + (H/128)*4`，适用于全部组走压缩分支的构造数据；对真实模型应同时统计 BF16 fallback 比例，否则“有效 GB/s”会高估实际压缩收益。
+
+`zero_copy=True` 与 `use_logfmt=True` 在 C++ 中被显式拒绝。原因不是 API 偏好，而是 zero-copy 要求 NIC 直接读取 GEMM 已写好的 BF16 registered buffer；LogFMT 则必须在 combine SEND kernel 中做分析、编码和重排，两条数据生产方式冲突。
+
+## 7. Send/Recv Phase、完成链与 Hook 生命周期
+
+### 7.1 两个 phase 到底各做什么
+
+底层 `phases` 是 bitmask：
+
+```text
+LEGACY_LOW_LATENCY_SEND_PHASE = 1
+LEGACY_LOW_LATENCY_RECV_PHASE = 2
+```
+
+| API | SEND phase | RECV phase |
+|---|---|---|
+| dispatch | 路由、量化/打包、payload put、本地 warp 汇合、count AMO、清下一 slot signal | 等 count，解码数量，把固定远端槽压紧到 expert-major 输出，写 `recv_count/src_info/layout_range` |
+| combine | 按 `layout_range` 取 expert 输出，BF16 或 LogFMT 编码，payload put、flag AMO、清下一 slot signal | 等各 global expert flag，grid sync，加载/解码，乘 `topk_weights`，FP32 累加并写 BF16 |
+
+非 hook 模式把两个 bit 一起传给同一次 kernel launch，因此调用内部会等待通信完成。hook 模式第一次只传 SEND，返回的 callable 再以相同捕获参数只传 RECV。
+
+### 7.2 五个不能混为一谈的“完成”
+
+一次 hook 调度中的事件顺序是：
+
+```mermaid
+sequenceDiagram
+    participant CPU as Python/CPU
+    participant S as current CUDA stream
+    participant K as SEND/RECV kernel
+    participant N as NIC
+    participant P as remote PE
+    CPU->>S: enqueue SEND kernel
+    CPU-->>CPU: low_latency_* 返回 hook
+    S->>K: 执行 SEND，构造 WQE/doorbell
+    K->>N: work 已发布
+    S->>S: 执行中间独立计算
+    N->>P: payload 后同 QP count/flag
+    CPU->>S: hook() enqueue RECV kernel
+    S->>K: RECV acquire-poll 通知
+    K->>K: 搬运/解码/规约并完成输出
+    S->>S: 后续同 stream 消费者可安全执行
+```
+
+必须区分：
+
+1. **Python API 返回：** 只表示 launch 已入队且 callable 已创建，不代表 SEND kernel 已跑完。
+2. **SEND kernel 完成：** WQE 已构造/发布，本地打包工作结束；远端 payload 可以仍在途。
+3. **NIC 完成传输：** 由同 QP count/flag 协议向远端接收 kernel 暴露，CUDA stream 本身不会自动感知非本地网络依赖。
+4. **调用 `hook()` 返回到 Python：** 通常只表示 RECV kernel 又被 enqueue；它不是隐式 `cudaDeviceSynchronize()`。
+5. **RECV kernel 在 CUDA stream 上完成：** 输出才对该 stream 后续 kernel 可消费。CPU 读取需另做同步，其他 CUDA stream 需显式 event/wait。
+
+这也是经典图中细竖线仍有成本的原因：SEND/RECV kernel 会短时使用 SM；所谓“0-SM overlap”只指两者之间的 NIC 飞行窗口没有常驻通信 kernel。
+
+### 7.3 current stream、comm stream 与事件
+
+**源码可证：** 当前实现实际读取 `at::cuda::getCurrentCUDAStream()`。源码旁的 “default stream” 注释容易造成歧义；准确行为是调用当时的 **current compute stream**，它不保证一定是 CUDA legacy default stream。
+
+- `return_recv_hook=True`：SEND 和稍后的 RECV 都 launch 到该 current stream；中间计算也按调用方 enqueue 顺序排在二者之间。
+- `return_recv_hook=False, async_finish=False`：专用 `comm_stream` 先等待 compute stream，执行 SEND+RECV，随后 compute stream 等待通信流。
+- `return_recv_hook=False, async_finish=True`：不让 compute stream 反向等待，而是返回 `EventOverlap`；Python wrapper 保存相关 tensor 引用以避免异步完成前析构。
+- `return_recv_hook=True` 与 `async_finish=True` 被 C++ 显式禁止；hook 路径也不额外返回一个“RECV 已完成”事件。若输出要跨 stream 使用，调用方应在 `hook()` 之后于当前 stream 记录 event，再让消费者 stream wait。
+
+Hook 应视为一次性 continuation。实现返回的是普通 callable，并不替调用方做“只调用一次”的状态检查；重复调用会重复 launch RECV，漏调则会让下一个 buffer 复用周期破坏协议。
+
+### 7.4 经典双 micro-batch 的完整时间线
+
+下表把图中的边界、API、slot 和可重叠计算放到同一张表中。假设初始 `low_latency_buffer_idx=0`：
+
+| 时刻 | 前台 current stream | NIC/远端后台 | slot/依赖 |
+|---:|---|---|---|
+| t0 | `Attention A` | — | 产生 A 的 `x/topk_idx` |
+| t1 | `dispatch(A, hook=True)` 的 SEND | Dispatch A 在途 | 使用 slot 0；返回 `hook_DA` |
+| t2 | `Attention B` | Dispatch A 在途 | A 的输入与 hook 捕获对象仍存活 |
+| t3 | `hook_DA()` RECV | 等待不足部分后收 A | slot 0 的输出/handle 完成 |
+| t4 | `dispatch(B, hook=True)` SEND | Dispatch B 在途 | 使用 slot 1；清 slot 0 signal |
+| t5 | `MoE A` | Dispatch B 在途 | 只处理 `recv_count_A[e]` 有效行 |
+| t6 | `hook_DB()` RECV | 收 B | slot 1 dispatch 已消费 |
+| t7 | `combine(A, hook=True)` SEND | Combine A 在途 | 使用 slot 0；清 slot 1 signal |
+| t8 | `MoE B` | Combine A 在途 | B 的 expert 输出计算 |
+| t9 | `hook_CA()` RECV | 收 A 返回并加权规约 | A 的 `combined_x` 完成 |
+| t10 | `combine(B, hook=True)` SEND | Combine B 在途 | 使用 slot 1；清 slot 0 signal |
+| t11 | 下一轮 `Attention A'` | Combine B 在途 | 只安排不依赖 B combined 输出的计算 |
+| t12 | `hook_CB()` RECV | 收 B 返回并加权规约 | B 可进入下一依赖层 |
+
+在同一 current stream 上，t3/t4、t6/t7、t9/t10 可以在 CPU 代码中相邻 enqueue；前一 RECV 的 kernel 完成先于后一 SEND 对旧 signal 的清理。若拆到不同 stream，必须用 event 显式恢复这个 happens-before。
+
+理论上的可见时间为：
+
+```text
+T_visible = T_send_issue + max(T_independent_compute, T_network_remaining)
+          + T_recv_unpack_or_reduce
+```
+
+这只是**推导模型**。如果 NIC/HBM 流量拖慢了 Attention/MoE，实际中间计算时间应写成 `T_compute_under_overlap`；若它显著大于独立测得的 `T_compute_alone`，即使通信被隐藏，端到端收益也会收窄。
+
+### 7.5 Hook 捕获对象与可复用边界
+
+Dispatch hook 捕获/依赖：原始 `x/topk_idx`、固定 RDMA slot、预分配的 `packed_recv_x/scales/count/src_info/layout_range`、mask/统计指针和 layout 参数。Combine hook 捕获/依赖：expert 输出 `x`、原始 `topk_idx/topk_weights`、dispatch handle、RDMA slot、`combined_x` 与可选统计/out。
+
+安全检查清单：
+
+- 在对应 RECV 完成前，不释放、resize 或原地改写上述 tensor；
+- `layout_range` 是 dispatch RECV 才填好的，不能在 `hook_D` 之前启动依赖它的 combine；
+- 下一个使用同一 slot 的 API 前，旧 hook 必须完成；
+- zero-copy view 的生产 GEMM 必须先于 combine SEND，NIC 尚在读该 slot 时不能覆盖；
+- 所有 rank 维持兼容的 phase 次序，避免某 rank 等待一个从未由对端发出的 count/flag；
+- 本地 P2P bypass 可能使用 GPU load/store，与前台计算争用资源；若目标是最纯粹的 NIC-only 重叠，应分别测试禁用与启用 P2P。
 
 ## 8. Zero-Copy Combine
 
-[`get_next_low_latency_combine_buffer`](../deep_ep/buffers/legacy.py#L700) 暴露下一轮 combine 将使用的 RDMA send buffer，形状与 expert-major GEMM 输出一致：
+[`get_next_low_latency_combine_buffer`](../deep_ep/buffers/legacy.py#L700) 返回**下一次 API 调用将使用的当前 ping-pong slot** 中、已经注册的 combine send 区视图：
+
+```text
+shape   = [L, R*M, H]
+strides = [R*M*(Cmsg/2), Cmsg/2, 1]     # 以 BF16 元素计
+```
+
+由于每条消息还夹有 `H/128 * sizeof(nv_bfloat162)` 的 metadata 空间，第二维 stride 大于 `H`；这不是普通 contiguous `[L,R*M,H]` 张量。上游 GEMM/拷贝必须尊重该 stride，不能把它当成紧密数组做裸 `memcpy`。
+
+当前测试所验证的调用形态是：
 
 ```python
 rdma_out = buffer.get_next_low_latency_combine_buffer(handle)
-# 让 GEMM 直接写 rdma_out
+rdma_out[:, :, :] = simulated_gemm_x       # 实际集成应让 GEMM 直接写 rdma_out
+
 combined_x, event, hook = buffer.low_latency_combine(
-    rdma_out,
+    simulated_gemm_x,                       # 当前 ABI 仍要求一个同形 contiguous x 做检查
     topk_idx,
     topk_weights,
     handle,
     zero_copy=True,
+    use_logfmt=False,
+    return_recv_hook=True,
 )
 ```
 
-正常 combine 先把 `x` 复制到 registered send buffer，再由 NIC 读取。zero-copy 要求上游 GEMM 直接写该 buffer，可消除一次 HBM copy。代价是：
+这也修正了一个容易写错的示例：不能直接把 `rdma_out` 作为 `x` 参数传入，因为 C++ 入口当前仍断言 `x.is_contiguous()`；zero-copy 分支真正发送的是 registered `buf_ptr`，常规 `x` 不再作为远端 RDMA payload。未来 API 若改变，应重新以测试为准。
 
-- 上层必须严格遵守 buffer 的 shape、dtype 和生命周期；
-- 必须与 ping-pong index 对齐；
-- 不能覆盖尚未完成的上一轮数据；
-- `LogFMT` 路径与 zero-copy 的组合受到测试限制。
+收益与代价：
+
+- 让 grouped GEMM 直接产生网络布局，省去 `x → registered send buffer` 的一次 HBM copy；
+- 本地目标存在 P2P pointer 时，kernel 仍可能从 `buf_ptr` copy 到目标，因此“zero-copy”不等于全拓扑绝对零复制；
+- view 必须在对应 combine SEND 发布且 NIC 不再读取前保持有效，不能跨越下一次同 slot 复用；
+- `use_logfmt=True && zero_copy=True` 被内核硬性拒绝；
+- 调优时应把 GEMM 写带 stride 的效率与节省的 copy 时间一起测，不能只看通信 kernel。
 
 ## 9. Shrink / Rank Mask
 
@@ -656,10 +942,10 @@ combine_hook()
 
 ### 13.2 生命周期约束
 
-- 两套 buffer 意味着不要长期保留超过两轮的返回 tensor；
+- 两套 slot 要求旧 RECV 在同一 slot 再次复用前完成；普通输出张量独立分配，但 hook 捕获对象仍须存活；
 - hook 捕获了当前输入、输出和 layout，调用前不得释放或改写；
 - `EventOverlap` 在 async 模式下保存相关 tensor 引用，避免 stream 完成前被析构；
-- zero-copy buffer 只属于“下一轮” combine。
+- zero-copy view 只与紧随其后的 combine API 调用配对；中间插入其他 low-latency 调用会改变 slot。
 
 ### 13.3 QP 与容量
 
@@ -672,31 +958,167 @@ combine_hook()
 
 即使数据面是点对点 RDMA，buffer 清理、barrier 和 phase 协议仍要求各 rank 以一致顺序推进。某一 rank 漏调 hook、重复使用错误 buffer 或提前进入下一轮，都可能造成其他 rank 等待错误的 count/flag。
 
-## 14. 性能机制总结
+## 14. Timeout、卡死与协议调试
 
-low-latency 之所以适合 decode：
+### 14.1 三类 timeout 对应哪一层
 
-- 固定输出形状，消除 CPU exact-count round trip；
-- 数据量化、路由和 RDMA put 融合在一个 kernel；
-- QP 与 local expert 对齐，降低共享/仲裁开销；
-- payload 后发 count/flag，协议简单；
-- expert-major 输出可直接接 grouped GEMM；
-- send/recv phase 可拆，NIC 传输期间不占计算 SM；
-- ping-pong buffer 把清零与下一轮准备流水化；
-- combine 可融合权重规约、LogFMT 和 in-place 输出；
-- zero-copy 可让 GEMM 直接生产网络 send buffer。
+当前常量 `LEGACY_NUM_TIMEOUT_CYCLES = 200000000000`，源码注释将 200G cycles 近似为 100 秒。它是防永久自旋的工程阈值，不是稳定的服务 SLA；`clock64()` 周期与设备时钟相关，不能脱离 GPU 时钟直接换算成统一墙钟时间。
 
-## 15. 建议的源码阅读顺序
+| 日志 | 正在等待 | 优先怀疑 |
+|---|---|---|
+| `timeout for barrier` | 自定义 mask-aware barrier 的远端计数 | 某 rank 未进入相同 collective 顺序、已崩溃、mask 不一致或 transport 未通 |
+| `timeout for dispatch receive` | `(local_expert, src_rank)` 的负数 count | 源 rank 未发布 dispatch、QP/WQE 停滞、slot 被提前清理/复用、参数不一致 |
+| `timeout for combine receive` | 某 global expert 的返回 flag | 对端 combine 未调用、dispatch handle/phase 错配、expert 计算未完成、slot/QP 协议被破坏 |
+
+正常“某源 rank 给该 expert 发送 0 token”不会留下 0：发送端仍写 `-1`，接收端解码为 0。因此 dispatch 永久看到 count=0 不是正常空路由，而是通知确实没有到达、被 mask，或 signal 被错误清理。
+
+未启用 shrink 时，timeout 分支打印后执行 `trap()`；启用 shrink 时把相关 rank 的 mask 置 1 并继续降级。后者会丢 expert 贡献，应由服务层显式标记请求为降级结果，不能当作精确恢复。
+
+### 14.2 从最小不变量开始排查
+
+建议按以下顺序留证，不要先盲目增大 timeout：
+
+1. **全 rank 配置一致性：** 记录 commit、world/EP rank、`R/E/L/M/H/K`、dtype、FP8/UE8M0/LogFMT/zero-copy/hook/shrink 开关；确认 `E%R=0`、`T<=M`、`R*M%4=0`、FP8 时 `H%512=0`。
+2. **初始化与 transport：** 确认环境变量在 NVSHMEM 初始化前设置，所有 PE 完成同序对称分配与 bootstrap；记录 HCA、port、GID、PCIe/NVLink 拓扑及 P2P 开关。
+3. **phase 顺序：** 为每个 micro-batch 记录 `dispatch SEND → dispatch RECV → combine SEND → combine RECV` 和 slot 0/1；检查是否漏调/重调 hook，或在旧 RECV 前由下一 SEND 清了 signal。
+4. **QP 容量：** 核对 `num_qps_per_rank=L` 的实验配置及 `NVSHMEM_QP_DEPTH >= 2*(M+1)`；观察问题是否只在高偏斜或高 EP 下出现。
+5. **定位慢对端：** 提供 `[R]` wait stats slice 和日志中的 `src_rank/local_expert_idx`；同时取所有 rank 的最大延迟，不用平均值掩盖单个慢 rank。
+6. **数据/通知路径：** 先用 BF16、关闭 LogFMT/zero-copy/P2P/shrink，最小 `T/K` 复现；再一次只恢复一个变量。若 BF16 仍 timeout，优先查 transport、phase 与 buffer，而非量化误差。
+7. **平台差异：** legacy 文档承认使用激进 PTX load/store；在非已验证平台异常时，可用 `DISABLE_AGGRESSIVE_PTX_INSTRS=1` 重新构建做 A/B 诊断。它是定位手段，不应在没有基准的情况下宣称必然修复或无性能代价。
+
+`dispatch_wait_recv_cost_stats` 与 `combine_wait_recv_cost_stats` 累计的是设备 `clock64()` 等待周期。它们适合在同机、同频率策略下比较 rank 热点；要报告绝对微秒，应同步记录 GPU 时钟或用 CUDA event/Profiler 交叉校准。统计值还包含接收 kernel 到达轮询点的调度差异，不能直接等同于纯网络 RTT。
+
+### 14.3 清理与重试边界
+
+`clean_low_latency_buffer()` 前后都有全局 barrier。仅在所有旧 kernel/NIC 请求已完成、所有健康 rank 以一致顺序进入时清理；在未知在途状态下单 rank 强行清零，会把“旧通知”问题变成“对端永远等不到通知”。若进程已部分失败，优先重建通信域/Buffer；shrink 只能在业务允许缺失 expert 时作为显式降级路径。
+
+## 15. 性能机制与科学测量工作流
+
+### 15.1 先定义要回答的问题
+
+low-latency 的收益来自四个可分离机制：
+
+1. 固定输出形状，消除 CPU exact-count round trip；
+2. 量化/路由/put 融合，减少 launch 与 HBM 往返；
+3. SEND/RECV 拆分，让 NIC 飞行时间与独立计算重叠；
+4. expert-major、LogFMT、zero-copy 减少下游重排或网络/HBM 字节。
+
+科学实验不应只报一个 GB/s。至少分别测：
+
+```text
+T_issue          SEND kernel 时间
+T_wait+recv      RECV kernel（含剩余等待、解包/规约）时间
+T_comm_serial    非 hook 的完整通信时间
+T_compute_alone  Attention/MoE 单独时间
+T_overlap_e2e    按真实流水执行的端到端时间
+slowdown_compute = T_compute_under_overlap / T_compute_alone
+```
+
+理想节省的上界约为 `min(T_independent_compute, T_network_window)`；实际收益还要减去 issue/recv、流依赖、HBM/L2/PCIe/NVLink 争用和路由偏斜。该式是**推导模型**，最终结论必须来自完整 decode step。
+
+### 15.2 仓库基准工具的精确默认值
+
+**源码可证：** [`deep_ep/utils/testing.py`](../deep_ep/utils/testing.py) 中：
+
+- `bench` 默认 50 次 warmup + 50 次 measurement；每次 measurement 前写一个 256 MB tensor 冲刷 L2；最终主动丢弃第一个测量值，所以默认统计实际使用 49 个样本，并返回 average/min/max。
+- `bench_kineto` 默认 `num_tests=30`，先额外执行一次函数并同步，再做 profiler warmup/active period；hook 模式可用 `num_kernels_per_period=2` 把同名 kernel 的 SEND/RECV 两次 launch 拆开统计。
+- profiler 与 Nsight/Compute Sanitizer 同时使用会冲突；`EP_USE_NVIDIA_TOOLS` 启用时 helper 会跳过 Kineto 定时。
+
+复现实验应保留这些默认值作为一组结果，再增加原始样本采集，报告 p50/p95/p99、跨 rank 最大值和至少 3 次独立进程启动。平均值用于吞吐，尾延迟才更接近在线 decode 的风险。
+
+### 15.3 字节口径必须显式写出
+
+测试按本 rank 每个有效 top-k 选择累计“应用 payload 字节”：
+
+```text
+Bdispatch_FP8 = Nvalid * (H + (H/128)*4 + 16)
+Bdispatch_BF16 = Nvalid * (2H)
+Bcombine_BF16 = Nvalid * (2H)
+Bcombine_LogFMT_ideal = Nvalid * (H*10/8 + (H/128)*4)
+BW_effective = B / latency
+```
+
+其中 `Nvalid = count(topk_idx != -1)`。该口径不含 IB/RC 包头、ACK、WQE/CQ、重试，也可能把本地 P2P/self 路由和 LogFMT BF16 fallback 简化掉；所以它是算法有效带宽，不是 NIC 端口的 on-wire throughput。出现高于单个 400 Gb/s 端口约 50 GB/s 的表值时，不能据此声称物理链路超速，必须配合 NIC 计数器和实际 remote bytes 解释。
+
+### 15.4 最小可复现实验矩阵
+
+固定软件/硬件后，一次只改变一个因素：
+
+| 维度 | 建议档位 | 要回答的问题 |
+|---|---|---|
+| phase | 非 hook；hook 无计算；hook + 真实 Attention/MoE | 分离 launch、纯通信与可隐藏窗口 |
+| dtype | BF16；FP8；FP8+round；UE8M0 | 量化开销、网络字节与数值误差 |
+| combine | BF16；LogFMT；zero-copy | 网络压缩与 HBM copy 的独立贡献 |
+| 路由 | 均匀；单 expert 热点；真实 gate trace | 平均性能对偏斜是否稳健 |
+| 容量 | `M=T`；轻度余量；远大于 T | 固定布局浪费、cache 和 QP 深度影响 |
+| 拓扑 | P2P 开/关；单机/跨机；不同 rail 绑定 | 区分 GPU copy 与纯 RDMA 路径 |
+| 规模 | EP8→EP256（硬件允许范围） | QP 状态、扇出和尾 rank 扩展性 |
+
+每次记录：GPU/HCA 型号与固件、CUDA/driver/NVSHMEM/PyTorch、GPU/NIC/NUMA 拓扑、环境变量、功耗/时钟锁定、路由直方图、`M/H/K/E/R`、有效/远端字节、L2 flush、warmup/sample 数、所有 rank 的延迟分布。正确性测试必须先覆盖 `tests/legacy/test_low_latency.py` 中 BF16/FP8、round/UE8M0、hook、LogFMT、zero-copy、out 和 shrink 的合法组合。
+
+### 15.5 官方 H800/CX7 数据及其适用边界
+
+**官方资料背景，硬件/工作负载特定：** DeepEP legacy 文档给出的配置是 H800、每 GPU 连接 CX7 400 Gb/s（约 50 GB/s）、`T=128`、`H=7168`、top-8、dispatch FP8、combine BF16：
+
+| EP | Dispatch latency | 有效 RDMA BW | Combine latency | 有效 RDMA BW |
+|---:|---:|---:|---:|---:|
+| 8 | 77 μs | 98 GB/s | 114 μs | 127 GB/s |
+| 16 | 118 μs | 63 GB/s | 195 μs | 74 GB/s |
+| 32 | 155 μs | 48 GB/s | 273 μs | 53 GB/s |
+| 64 | 173 μs | 43 GB/s | 314 μs | 46 GB/s |
+| 128 | 192 μs | 39 GB/s | 369 μs | 39 GB/s |
+| 256 | 194 μs | 39 GB/s | 360 μs | 40 GB/s |
+
+这些数值只能作为该 H800/CX7、特定 token/hidden/top-k 与官方软件栈的参照，不能外推为其他 GPU/HCA/rail 的承诺。尤其“有效 RDMA BW”应按上一节的应用字节口径理解；比较自己的结果时优先对齐 latency、远端比例和路由分布。
+
+### 15.6 何时 low-latency 未必更快
+
+- `T`/消息变大后，高吞吐 normal 路径的批量化可能摊薄协议开销；
+- `T_issue + T_recv` 已占主要比例时，几乎没有可隐藏的网络窗口；
+- 独立计算短于网络剩余时间时，hook 仍在 RECV 中自旋；
+- 路由高度偏斜会让单 expert/QP/NIC 成为尾部瓶颈；
+- zero-copy 的 strided GEMM 写入损失可能超过省下的 copy；
+- LogFMT fallback 多或数值容差不允许时，压缩收益不足；
+- P2P/NIC DMA 与 Attention/MoE 争用 HBM/L2/互连时，释放 SM 不等于计算无减速；
+- QP 数/深度过大可增加 NIC 和 GPU queue 状态压力，过小又串行化。
+
+因此最终验收指标应是固定准确率约束下的 decode step p95/p99、每 token latency 与整机吞吐，而不是单 kernel 最小值。
+
+## 16. 建议的源码阅读顺序
 
 1. [`get_low_latency_rdma_size_hint`](../deep_ep/buffers/legacy.py#L176) 和 [`LowLatencyLayout`](../csrc/legacy/config.hpp)：先看固定显存代价。
-2. [`Buffer.low_latency_dispatch`](../deep_ep/buffers/legacy.py#L553)：理解 Python 输出、handle 与约束。
-3. [`Buffer::low_latency_dispatch`](../csrc/legacy/buffer.hpp#L1456)：理解 ping-pong、stream、phase 和 hook。
-4. [`internode_ll::dispatch`](../csrc/kernels/legacy/internode_ll.cu#L129)：看融合量化、expert slot、count 协议和 packed receive。
-5. [`Buffer.low_latency_combine`](../deep_ep/buffers/legacy.py#L624)：理解权重、zero-copy、out。
-6. [`Buffer::low_latency_combine`](../csrc/legacy/buffer.hpp#L1598)：看 combine 的 phase 编排。
-7. [`internode_ll::combine`](../csrc/kernels/legacy/internode_ll.cu#L715)：看回传、等待 flag 和加权规约。
-8. [`tests/legacy/test_low_latency.py`](../tests/legacy/test_low_latency.py)：把 FP8、hook、LogFMT、zero-copy 和 shrink 组合跑通。
+2. [`Buffer.low_latency_dispatch`](../deep_ep/buffers/legacy.py#L553) 与 [`Buffer::low_latency_dispatch`](../csrc/legacy/buffer.hpp#L1456)：理解输出、ping-pong、stream 和 hook。
+3. [`internode_ll::dispatch`](../csrc/kernels/legacy/internode_ll.cu#L129)：追踪 pack、地址、payload put、count 与 RECV。
+4. [`ibgda_device.cuh`](../csrc/kernels/legacy/ibgda_device.cuh)：追踪 RC QP、key lookup、WQE、doorbell 和 quiet。
+5. [`Buffer::low_latency_combine`](../csrc/legacy/buffer.hpp#L1598) 与 [`internode_ll::combine`](../csrc/kernels/legacy/internode_ll.cu#L715)：追踪 LogFMT、flag 与权重规约。
+6. [`tests/legacy/test_low_latency.py`](../tests/legacy/test_low_latency.py) 和 [`deep_ep/utils/testing.py`](../deep_ep/utils/testing.py)：核对合法组合、字节口径和测量方法。
 
-## 16. 一句话总结
+## 17. 可追溯参考资料
 
-V1 low-latency 的本质是：**为每个 expert/来源预留固定 RDMA 槽位，用 GPU 融合量化和 IBGDA 发包，以 count/flag 完成无 CPU 的到达协议，再通过 ping-pong buffer 和可拆 send/recv hook 把 NIC 传输隐藏在其他 micro-batch 计算之后。**
+以下网页均于 **2026-08-26** 访问；核心语义优先引用项目、论文与 NVIDIA 官方资料，不以 issue 或社区博客作为事实依据。
+
+| 类型 | 资料 | 本文用途 | 访问日期 |
+|---|---|---|---|
+| DeepEP 上游代码 | [DeepEP commit `01dc3aaa...`](https://github.com/deepseek-ai/DeepEP/tree/01dc3aaac82068020353dce2c302e38153c0bfaa) | 本文固定上游源码/测试基线；本地教程提交 `f99f068...` 的父提交 | 2026-08-26 |
+| DeepEP 官方文档 | [Legacy kernels](https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md) | V1 API、H800/CX7 性能表、hook/zero-copy/环境说明 | 2026-08-26 |
+| DeepSeek 论文 | [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)（[HTML](https://ar5iv.labs.arxiv.org/html/2412.19437)） | EP320 解码、IBGDA、双 micro-batch 与每 expert 小 batch 背景 | 2026-08-26 |
+| NVSHMEM 官方 | [Using NVSHMEM](https://docs.nvidia.com/nvshmem/api/latest/using.html) | PE/对称堆、弱内存序、fence/quiet 基础语义 | 2026-08-26 |
+| NVSHMEM 官方 | [Memory Ordering](https://docs.nvidia.com/nvshmem/api/latest/gen/api/ordering.html) | RMA/AMO 排序与完成边界 | 2026-08-26 |
+| NVSHMEM 官方 | [Signaling Operations](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html) | put-with-signal 与独立 signal 的语义边界 | 2026-08-26 |
+| NVSHMEM 官方 | [Remote Memory Access](https://docs.nvidia.com/nvshmem/api/latest/gen/api/rma.html) | one-sided RMA/NBI 定义 | 2026-08-26 |
+| NVSHMEM 官方 | [Queue Pair Management](https://docs.nvidia.com/nvshmem/api/latest/gen/api/qp.html) | 多 QP 独立性与同步注意事项 | 2026-08-26 |
+| NVSHMEM 官方 | [Environment Variables](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html) | IBGDA、RC QP、P2P、heap granularity 配置背景 | 2026-08-26 |
+| NVSHMEM 官方 | [Performance Best Practices](https://docs.nvidia.com/nvshmem/release-notes-install-guide/best-practice-guide/performance.html) | IBGDA/RC QP 的资源与性能取舍 | 2026-08-26 |
+| NVSHMEM 官方 | [CUDA Interactions](https://docs.nvidia.com/nvshmem/api/latest/cuda-interactions.html) | CUDA stream 与非本地依赖的边界 | 2026-08-26 |
+| NVIDIA 官方 | [GPUDirect Async / IBGDA 原理](https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/) | GPU 构造 WQE、doorbell、NIC DMA 数据路径 | 2026-08-26 |
+| NVIDIA 官方 | [GPUDirect RDMA Documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/) | GPU memory registration、拓扑与内存序背景 | 2026-08-26 |
+| NVIDIA 官方源码 | [NVSHMEM IBGDA device transport](https://github.com/NVIDIA/nvshmem/blob/devel/src/include/non_abi/device/pt-to-pt/ibgda_device.cuh) | DeepEP legacy helper 的上游实现脉络；具体结论仍以本地副本为准 | 2026-08-26 |
+
+## 18. 跨文档导航
+
+- [V1 normal / SM 通信实现](implementation-v1-sm.md)：适合训练/prefill 和较大批量，解释 channel、warp/thread、NVLink 与 RDMA forwarding。
+- [V2 Elastic 通信实现](implementation-v2-elastic.md)：解释 V2 的 elastic、pipeline-parallel 与新协议边界；不要把 V1 的 hook/slot 语义原样套用。
+
+## 19. 一句话总结
+
+V1 low-latency 的本质是：**在 NVSHMEM 对称注册内存中为 expert/source 预留固定 RDMA 槽位，由 GPU warp 构造 IBGDA WQE，以同一 expert QP 上的 payload→count/flag 序列建立内部到达协议，再借助按调用翻转的双 slot 与 SEND/RECV hook，把 NIC 飞行窗口嵌入另一个 micro-batch 的 Attention/MoE；其正确性依赖严格的内存序、phase、slot 和生命周期不变量，性能则必须在真实 decode 流水与尾延迟上验证。**
