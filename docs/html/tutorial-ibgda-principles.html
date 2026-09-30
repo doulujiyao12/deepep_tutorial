@@ -1,0 +1,316 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="从 symmetric 地址到 WQE、doorbell 和 CQ，逐步解释 GPU 如何驱动网络。"><title>GPUDirect Async 与 IBGDA · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link " href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link active" href="tutorial-ibgda-principles.html" aria-current="page"><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link " href="tutorial-nvshmem-deployment.html" ><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link " href="tutorial-nccl-device-gin.html" ><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">基础 · 请求与完成 · 01 / 06</div><h1>GPUDirect Async 与 IBGDA</h1><p>从 symmetric 地址到 WQE、doorbell 和 CQ，逐步解释 GPU 如何驱动网络。</p><div class="chips"><span class="chip">16 分钟参考阅读</span><span class="chip">14 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><section class="learning"><h2>本篇阅读任务</h2><p>跟踪一次 token 发送，分别标出数据地址、QP、发布点和完成点。</p><details><summary>读后自检：GPU 已发布 WQE 后，可以立即复用源 buffer 吗？</summary><p>不能仅凭发布推出可复用。还要证明 NIC 已消费输入，并满足应用层 buffer 生命周期。</p></details></section><article class="article"><h1 id="gpudirect-async-与-ibgda从消息到-nic-的源码教程"><a class="heading-link" href="#gpudirect-async-与-ibgda从消息到-nic-的源码教程">GPUDirect Async 与 IBGDA：从消息到 NIC 的源码教程</a></h1>
+<blockquote>
+<p>基础篇 A · 建议先读 · 目标：能够沿 DeepEP 源码解释一次 RDMA 请求如何产生、提交、完成，以及它为什么仍会消耗 SM。</p>
+</blockquote>
+<p>本文把 NVIDIA 的 IBGDA 原理文章作为概念入口，把本地 DeepEP 的实际实现作为代码证据。研究日期为 <strong>2026-09-23</strong>；源码基线为 <code>01dc3aaac82068020353dce2c302e38153c0bfaa</code>，本地 HEAD 为 <code>1df6d4c2466e1b32b80ef7ae559cff79972d4acc</code>。代码摘录保留关键语句，省略处明确标出；教学模型单独标注，不是可直接编译的完整程序。</p>
+<p><a href="index.html">返回六篇总目录</a> · <a href="tutorial-nvshmem-deployment.html">下一篇：CPU-assisted 与部署</a> · <a href="implementation-v1-sm.html">对照 V1 SM</a> · <a href="implementation-v1-low-latency.html">对照 V1 LL</a></p>
+<h2 id="1-入门先回答三个问题"><a class="heading-link" href="#1-入门先回答三个问题">1. 入门先回答三个问题</a></h2>
+<p>GPU 算出了 token，需要交给另一张 GPU 的 expert。这里有三个不同任务：决定往哪里发，通知 NIC 执行传输，判断结果什么时候可以使用。路由正确不代表 NIC 已经收到请求；NIC 收到请求也不代表接收 GPU 已经可以消费数据。</p>
+<p>学习本篇只需要 CUDA 的 thread/warp/block、指针和基本 producer/consumer 概念。不需要先会写网络驱动。建议先画出下表里的执行者，再读代码。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>执行者与对象</th>
+<th>项目中的观察入口</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>token 发给谁</td>
+<td>CUDA warp；top-k 到 expert/rank</td>
+<td><a href="source-b40af34d5f05ac40.html#L253"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>NIC 如何获得任务</td>
+<td>WQE、QP、DBR、doorbell</td>
+<td><a href="source-4ac4b10b9bd1d873.html#L81"><code>ibgda_device.cuh</code></a></td>
+</tr>
+<tr>
+<td>谁搬 payload</td>
+<td>网络路径由 NIC DMA；本地 P2P 可由 GPU copy</td>
+<td><a href="source-b40af34d5f05ac40.html#L263"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>什么时候消费</td>
+<td>count/tail/flag 协议及 acquire 读取</td>
+<td><a href="source-b40af34d5f05ac40.html#L323"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>什么时候回收资源</td>
+<td>CQ/quiet、phase、buffer 生命周期</td>
+<td><a href="source-4ac4b10b9bd1d873.html#L462"><code>ibgda_device.cuh</code></a></td>
+</tr>
+</tbody></table></div>
+<h2 id="2-gpudirect-rdma-与-ibgda-分别解决什么"><a class="heading-link" href="#2-gpudirect-rdma-与-ibgda-分别解决什么">2. GPUDirect RDMA 与 IBGDA 分别解决什么</a></h2>
+<p>GPUDirect RDMA 关注 NIC 对 GPU 内存的访问；IBGDA 进一步让 GPU 生成和提交网络请求。传统 CPU proxy 可以搭配 GPUDirect RDMA，所以“数据不经过 CPU 内存”并不能证明“控制面不经过 CPU”。NVIDIA 原理文章用两条路径对比这一点，重点是小消息请求提交能力。<a href="https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/" target="_blank" rel="noopener noreferrer">官方原理</a></p>
+<p>下面的框图是教学抽象：host 初始化工作在两种模式里都存在，图中只画逐消息热路径。</p>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-a995c4b288d1ab55.svg" target="_blank"><img src="assets/diagram-a995c4b288d1ab55.svg" alt="流程图：GPUDirect Async 与 IBGDA" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-a995c4b288d1ab55.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart TB
+  subgraph Proxy[CPU proxy 控制路径]
+    A[GPU 产生通信意图] --&gt; B[CPU proxy 构造并提交请求]
+    B --&gt; C[NIC 获取 WQE]
+  end
+  subgraph IBGDA[traditional IBGDA 控制路径]
+    D[GPU warp 构造 WQE] --&gt; E[GPU 发布队列并敲 doorbell]
+    E --&gt; F[NIC 获取 WQE]
+  end
+  C --&gt; G[NIC 读取源 GPU payload]
+  F --&gt; G
+  G --&gt; H[网络传输]
+  H --&gt; I[远端 NIC 写 GPU 内存]</code></pre></details></figure><p>这也解释了 DeepEP 的选择：expert routing 已经在 GPU 上，直接在 CUDA 内核内提交请求可以减少逐消息协调。收益大小必须结合 token 数、消息大小、QP 竞争与 NIC 能力测量。这里不把官方历史硬件的性能数字当作当前集群承诺。</p>
+<h2 id="3-先把术语放回物理对象"><a class="heading-link" href="#3-先把术语放回物理对象">3. 先把术语放回物理对象</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>名称</th>
+<th>本篇含义</th>
+<th>容易混淆的地方</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PE</td>
+<td>NVSHMEM 通信进程坐标</td>
+<td>不一定等于 DeepEP global rank</td>
+</tr>
+<tr>
+<td>symmetric heap</td>
+<td>各 PE 按一致规则分配的通信地址空间</td>
+<td>不保证不同 PE 的原始虚拟地址相等</td>
+</tr>
+<tr>
+<td>MR / lkey / rkey</td>
+<td>NIC 可访问内存及其访问 key</td>
+<td>普通 tensor 指针不会自动成为已注册内存</td>
+</tr>
+<tr>
+<td>QP</td>
+<td>NIC 的队列对及协议状态</td>
+<td>channel/expert 到 QP 是软件映射，不是硬件一一规定</td>
+</tr>
+<tr>
+<td>WQE</td>
+<td>队列里描述一次工作请求的字段</td>
+<td>payload 通常在另一块显存里</td>
+</tr>
+<tr>
+<td>DBR</td>
+<td>内存中的 doorbell record</td>
+<td>与 NIC MMIO doorbell 不是同一对象</td>
+</tr>
+<tr>
+<td>CQ / CQE</td>
+<td>完成队列及完成记录</td>
+<td>不等于应用已经完成 unpack 或 reduce</td>
+</tr>
+<tr>
+<td>ready / prod</td>
+<td>软件发布前缀、提交进度</td>
+<td>不等于接收端消费进度</td>
+</tr>
+</tbody></table></div>
+<p>本地 helper 文件开头声明它改编自 NVSHMEM 的 non-ABI 内部实现。这使它适合研究 WQE，但也意味着不能把结构字段当成稳定公共 API。<a href="source-4ac4b10b9bd1d873.html#L1">源码与许可说明</a></p>
+<h2 id="4-代码框图应用层怎样到达设备队列"><a class="heading-link" href="#4-代码框图应用层怎样到达设备队列">4. 代码框图：应用层怎样到达设备队列</a></h2>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-56f11b94114fb62c.svg" target="_blank"><img src="assets/diagram-56f11b94114fb62c.svg" alt="流程图：GPUDirect Async 与 IBGDA" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-56f11b94114fb62c.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart TD
+  A[Python Buffer.dispatch / low_latency_dispatch] --&gt; B[C++ Buffer 参数和 stream 编排]
+  B --&gt; C[normal internode / internode_ll CUDA kernel]
+  C --&gt; D[nvshmemi_ibgda_put_nbi_warp]
+  D --&gt; E[ibgda_get_rc 选择目标 QP]
+  D --&gt; F[ibgda_get_lkey_and_rkey 翻译地址]
+  F --&gt; G[按 registration chunk 拆分]
+  G --&gt; H[reserve slots 并写 WQE]
+  H --&gt; I[ibgda_submit_requests]
+  I --&gt; J[traditional: GPU post_send]
+  I --&gt; K[async: 发布 producer index]
+  J --&gt; L[NIC 执行]
+  K --&gt; M[CPU helper 辅助 post_send]
+  M --&gt; L</code></pre></details></figure><p><a href="source-c6e5d87e7bd1b888.html#L105"><code>legacy.py</code></a> 负责启用 transport；<a href="source-18b1208d0de8c03b.html#L255"><code>buffer.hpp</code></a> 建立 PE 与 heap；真正按消息访问 QP 的代码在 <a href="source-4ac4b10b9bd1d873.html#L335"><code>ibgda_device.cuh</code></a>。Python 函数每次调用的粒度和 CUDA 内部每次 put 的粒度不同，不应从 Python 层耗时直接推导 WQE 速率。</p>
+<h2 id="5-源码精读一pe-与-qp-的坐标"><a class="heading-link" href="#5-源码精读一pe-与-qp-的坐标">5. 源码精读一：PE 与 QP 的坐标</a></h2>
+<p><a href="source-18b1208d0de8c03b.html#L255"><code>Buffer::sync</code></a> 使用如下选择：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-keyword">auto</span> nvshmem_rank = low_latency_mode ? rank : rdma_rank;
+<span class="hljs-keyword">auto</span> num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;</code></pre></div>
+<p>normal 的跨节点通信把相同本地 GPU 编号组织成一个 RDMA world；LL 用整个 EP world 的 global rank 作为 PE。因此同一个数字 <code>pe=1</code> 在两种模式中可能代表不同物理 GPU。调试时必须记录模式和坐标系统。</p>
+<p>QP 索引来自 <a href="source-4ac4b10b9bd1d873.html#L81"><code>ibgda_get_rc</code></a>：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-type">const</span> <span class="hljs-keyword">auto</span> num_rc_per_pe = <span class="hljs-built_in">ibgda_get_state</span>()-&gt;num_rc_per_pe;
+<span class="hljs-keyword">return</span> &amp;state-&gt;globalmem
+    .rcs[pe * num_rc_per_pe * state-&gt;num_devices_initialized
+         + id % (num_rc_per_pe * state-&gt;num_devices_initialized)];</code></pre></div>
+<p><code>pe</code> 选择目标块；取模后的 <code>id</code> 选择该目标的连接资源。normal 常传 channel，LL 常传 local expert index。取模意味着多个逻辑执行者可能落在同一个实际 QP 上，它们必须遵守相同发布规则。QP 增多可能减少竞争，也会增加连接状态和内存开销。</p>
+<h2 id="6-源码精读二地址翻译与分块"><a class="heading-link" href="#6-源码精读二地址翻译与分块">6. 源码精读二：地址翻译与分块</a></h2>
+<p><a href="source-4ac4b10b9bd1d873.html#L205"><code>ibgda_get_lkey_and_rkey</code></a> 中真正决定远端地址的是：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-type">uint64_t</span> roffset = raddr - heap_start;
+<span class="hljs-comment">// ... 根据 chunk、dst_pe 与 dev_idx 查询 rkey ...</span>
+*out_raddr = <span class="hljs-built_in">reinterpret_cast</span>&lt;<span class="hljs-type">uint64_t</span>&gt;(
+    nvshmemi_device_state_d.peer_heap_base_remote[dst_pe]) + roffset;
+*out_rkey = device_key.key;
+<span class="hljs-keyword">auto</span> rchunk_size = device_key.next_addr - roffset;
+<span class="hljs-keyword">return</span> <span class="hljs-built_in">min</span>(lchunk_size, rchunk_size);</code></pre></div>
+<p>设本地 heap 起点为 <code>0x100000</code>，逻辑目标指针为 <code>0x102000</code>，远端 heap 起点为 <code>0x800000</code>。函数计算 offset <code>0x2000</code>，最终远端地址为 <code>0x802000</code>。这些地址是教学例子，不是实际运行地址。</p>
+<p>返回值是本地与远端当前注册块剩余长度的较小者。一个逻辑消息跨越注册边界时，需要拆成多个 WQE；不能用“一个 token 等于一个 WQE”估算所有情况。循环每次推进源、目标地址与 remaining bytes，代码还断言 WQE 数不超过一个 warp 的 lane 数。</p>
+<h2 id="7-源码精读三wqe-里到底写什么"><a class="heading-link" href="#7-源码精读三wqe-里到底写什么">7. 源码精读三：WQE 里到底写什么</a></h2>
+<p><a href="source-4ac4b10b9bd1d873.html#L280"><code>ibgda_write_rdma_write_wqe</code></a> 的核心字段：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp">raddr_seg.raddr = <span class="hljs-built_in">HtoBE64</span>(raddr);
+raddr_seg.rkey = rkey;
+raddr_seg.reserved = <span class="hljs-number">0</span>;
+data_seg.byte_count = <span class="hljs-built_in">HtoBE32</span>(bytes);
+data_seg.lkey = lkey;
+data_seg.addr = <span class="hljs-built_in">HtoBE64</span>(laddr);
+ctrl_seg = {<span class="hljs-number">0</span>};
+ctrl_seg.qpn_ds = <span class="hljs-built_in">HtoBE32</span>((qp-&gt;qpn &lt;&lt; <span class="hljs-number">8</span>) | <span class="hljs-number">3</span>);
+ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+ctrl_seg.opmod_idx_opcode =
+    <span class="hljs-built_in">HtoBE32</span>((wqe_idx &lt;&lt; <span class="hljs-number">8</span>) | MLX5_OPCODE_RDMA_WRITE);</code></pre></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>字段组</th>
+<th>代码解释</th>
+<th>若错误会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>remote address</td>
+<td><code>raddr/rkey</code> 指定目标注册区</td>
+<td>远端访问错误或错位写入</td>
+</tr>
+<tr>
+<td>local data</td>
+<td><code>laddr/lkey/bytes</code> 指定 NIC 要读的源区</td>
+<td>数据截断、越界或保护错误</td>
+</tr>
+<tr>
+<td>control</td>
+<td>QP 编号、队列序号、opcode</td>
+<td>错误请求类型或错误队列位置</td>
+</tr>
+<tr>
+<td>CQ update</td>
+<td>请求相应完成记录</td>
+<td>完成判断依赖对应 CQ 进度</td>
+</tr>
+<tr>
+<td>endian</td>
+<td><code>HtoBE*</code> 转换硬件字段格式</td>
+<td>不能把主机整数原样当 wire descriptor</td>
+</tr>
+</tbody></table></div>
+<p>这里三段结构各有 16 字节断言。不要由此推出整个 WQ slot 恰好 48 字节；slot 布局还由 WQEBB 和 helper 的地址计算决定。inline write 把小值放在 WQE 内；常规 write 只放地址和长度，payload 留在源显存。</p>
+<h2 id="8-源码精读四warp-合作与无空洞发布"><a class="heading-link" href="#8-源码精读四warp-合作与无空洞发布">8. 源码精读四：warp 合作与无空洞发布</a></h2>
+<p><a href="source-4ac4b10b9bd1d873.html#L335"><code>nvshmemi_ibgda_put_nbi_warp</code></a> 先让 lane 保存各块 key/地址，再执行：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-type">uint64_t</span> base_wqe_idx = <span class="hljs-number">0</span>;
+<span class="hljs-keyword">if</span> (lane_id == <span class="hljs-number">0</span>)
+    base_wqe_idx = <span class="hljs-built_in">ibgda_reserve_wqe_slots</span>(qp, num_wqes);
+base_wqe_idx = __shfl_sync(<span class="hljs-number">0xffffffff</span>, base_wqe_idx, <span class="hljs-number">0</span>);
+<span class="hljs-keyword">if</span> (lane_id &lt; num_wqes) {
+    <span class="hljs-keyword">auto</span> wqe_idx = base_wqe_idx + lane_id;
+    <span class="hljs-keyword">auto</span> wqe_ptr = <span class="hljs-built_in">ibgda_get_wqe_ptr</span>(qp, wqe_idx);
+    <span class="hljs-built_in">ibgda_write_rdma_write_wqe</span>(qp, my_laddr, my_lkey, my_raddr,
+                             my_rkey, my_chunk_size, wqe_idx, &amp;wqe_ptr);
+}
+__syncwarp();
+<span class="hljs-keyword">if</span> (lane_id == <span class="hljs-number">0</span>)
+    <span class="hljs-built_in">ibgda_submit_requests</span>&lt;kAlwaysDoPostSend&gt;(qp, base_wqe_idx,
+                                          num_wqes, message_idx);</code></pre></div>
+<p>lane 0 预留连续 slots，然后广播起点。每个参与 lane 填一块 descriptor，warp 汇合后提交。<code>__shfl_sync</code> 与 <code>__syncwarp</code> 的 full mask 对调用线程集合有要求；不能把整个 helper 放进任意只让单 lane 执行的分支。</p>
+<p><code>ibgda_submit_requests</code> 的 CAS 等的是已预留区间的前驱。假设 warp A 预留 <code>[10,12)</code>、warp B 预留 <code>[12,14)</code>，B 即使先写完，也不能把发布前缀从 10 跳到 14，否则 NIC 可能读到 A 尚未完成的 WQE。</p>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-1877878e8afe4d8b.svg" target="_blank"><img src="assets/diagram-1877878e8afe4d8b.svg" alt="流程图：GPUDirect Async 与 IBGDA" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-1877878e8afe4d8b.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>sequenceDiagram
+  participant A as Warp A
+  participant B as Warp B
+  participant Q as ready prefix
+  participant N as NIC
+  A-&gt;&gt;A: 保留 slots 10 到 11
+  B-&gt;&gt;B: 保留 slots 12 到 13 并写完
+  B-&gt;&gt;Q: CAS 12 到 14，等待
+  A-&gt;&gt;Q: 写完后 CAS 10 到 12
+  B-&gt;&gt;Q: CAS 12 到 14 成功
+  Q-&gt;&gt;N: 发布完整前缀后 post_send</code></pre></details></figure><h2 id="9-发布完成消费必须分别证明"><a class="heading-link" href="#9-发布完成消费必须分别证明">9. 发布、完成、消费必须分别证明</a></h2>
+<p><a href="source-4ac4b10b9bd1d873.html#L142"><code>ibgda_submit_requests</code></a> 的 <code>__threadfence()</code> 在 WQE 发布之前排序写入；它本身不等待远端 DMA。traditional 模式随后更新 DBR 并敲 doorbell；async 模式把 producer index 留给 helper 处理，详见下一篇。</p>
+<p><a href="source-4ac4b10b9bd1d873.html#L486"><code>nvshmemi_ibgda_quiet</code></a> 捕获已发布前缀并等待 CQ：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-keyword">auto</span> qp = <span class="hljs-built_in">ibgda_get_rc</span>(dst_pe, qp_id);
+<span class="hljs-keyword">auto</span> state = <span class="hljs-built_in">ibgda_get_state</span>();
+<span class="hljs-type">uint64_t</span> prod_idx = state-&gt;use_async_postsend
+    ? <span class="hljs-built_in">ld_na_relaxed</span>(qp-&gt;tx_wq.prod_idx)
+    : <span class="hljs-built_in">ld_na_relaxed</span>(&amp;qp-&gt;mvars.tx_wq.ready_head);
+<span class="hljs-built_in">ibgda_poll_cq</span>(qp-&gt;tx_wq.cq, prod_idx);</code></pre></div>
+<p>这段 simplified CQ poll 的源码注释明确要求同一 QP 不被其他线程并发使用。它不是一个随处插入就安全的全局同步器。NVSHMEM 公共 API 的 fence 与 quiet 也分别承担排序与完成职责，作用范围必须按调用端和 API 定义解释。<a href="https://docs.nvidia.com/nvshmem/api/latest/gen/api/ordering.html" target="_blank" rel="noopener noreferrer">NVSHMEM Memory Ordering</a></p>
+<h2 id="10-deepep-的三种实际搬运形式"><a class="heading-link" href="#10-deepep-的三种实际搬运形式">10. DeepEP 的三种实际搬运形式</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>形式</th>
+<th>payload 路径</th>
+<th>通知方式</th>
+<th>代码入口</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>normal 单节点</td>
+<td>GPU 对 IPC 映射地址 copy</td>
+<td>release tail / acquire tail</td>
+<td><a href="source-1d92511aa1100373.html#L212"><code>intranode.cu</code></a></td>
+</tr>
+<tr>
+<td>normal 跨节点</td>
+<td>ring buffer chunk 经 IBGDA，再节点内转发</td>
+<td>同 channel QP 的 tail AMO，反向 head credit</td>
+<td><a href="source-aae9334d79f3470a.html#L817"><code>internode.cu</code></a></td>
+</tr>
+<tr>
+<td>LL 网络分支</td>
+<td>固定 expert/source 槽经 IBGDA</td>
+<td>同 expert QP 的 count/flag</td>
+<td><a href="source-b40af34d5f05ac40.html#L253"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>LL P2P 分支</td>
+<td>peer heap 的 GPU warp copy</td>
+<td>对 peer count 做 release store</td>
+<td><a href="source-b40af34d5f05ac40.html#L323"><code>internode_ll.cu</code></a></td>
+</tr>
+</tbody></table></div>
+<p>LL 的网络 count 为 <code>-num_tokens_sent-1</code>。0 表示尚未发布，-1 表示已发布但没有 token；发送 0 条数据仍要发完成信息，否则接收方无法区分空消息与未到达。</p>
+<p>**案例练习：**一个源 rank 向某 expert 发 3 个 token，wire count 为 -4。接收方解码出 3 后才复制对应槽。将 count 改为普通 3 不只是改编码，还必须重新设计初始值、零 token 和重用协议。出处是 <a href="source-b40af34d5f05ac40.html#L323"><code>Issue count sends</code></a>。</p>
+<h2 id="11-性能怎样分析才不会只看链路带宽"><a class="heading-link" href="#11-性能怎样分析才不会只看链路带宽">11. 性能怎样分析才不会只看链路带宽</a></h2>
+<p>以下是根据本地调用链建立的教学模型，不是项目测量结果：</p>
+<div class="code-block"><div class="code-head"><span>TEXT · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-text">一条消息的关键路径 ≈ pack + key 查询/WQE 构造 + 发布 + NIC 排队 + 网络 + 接收处理
+吞吐上界 ≈ min(链路字节带宽, 消息提交率 × 每消息字节数, 内存搬运能力)</code></pre></div>
+<p>大消息常受带宽限制，小消息更容易暴露请求率限制；更多 QP 可能提升并行，也可能放大状态与 CQ 管理成本。量化减少 wire payload，却增加 pack 和 scale 元数据开销。研究时至少同时观察 token/s、microsecond latency、SM 使用、HBM 流量及消息率。</p>
+<p>IBGDA 只改变网络控制面。normal 的队列管理和转发 block 仍常驻；LL 通过 SEND/RECV 拆分，让二者之间的 NIC 在途时间可以与计算重叠。请把这条因果链与 <a href="implementation-v1-low-latency.html#11-经典图的逐阶段解读">经典图分析</a> 一起阅读。</p>
+<h2 id="12-从零开始的四次学习练习"><a class="heading-link" href="#12-从零开始的四次学习练习">12. 从零开始的四次学习练习</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>阅读与操作</th>
+<th>完成标准</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1：画对象</td>
+<td>看第 2–4 节，画 GPU、CPU、NIC、WQ、CQ</td>
+<td>能分别指出控制信息与 payload 的路线</td>
+</tr>
+<tr>
+<td>2：算地址</td>
+<td>看第 5–7 节，手算两个 PE 的 heap offset</td>
+<td>不把原始虚拟地址或 global rank 混用</td>
+</tr>
+<tr>
+<td>3：跟一次发送</td>
+<td>在 LL 中选择一个 token/expert，跟到 put/count</td>
+<td>写出目标槽、QP id、count 值、接收条件</td>
+</tr>
+<tr>
+<td>4：设计实验</td>
+<td>用同样 token/top-k 比较 P2P 与网络分支</td>
+<td>给出假设、控制变量、计时边界和误差，而非只报最快一次</td>
+</tr>
+</tbody></table></div>
+<p>建议先用现有 <a href="source-042f6d8fdf480b48.html#L318">LL 测试</a> 的小形状做正确性验证，再读 <a href="implementation-v1-sm.html">V1 SM 实现</a>。运行要求在下一篇展开。当前文档构建没有运行 GPU 通信实验。</p>
+<h2 id="13-自测与答案"><a class="heading-link" href="#13-自测与答案">13. 自测与答案</a></h2>
+<p><strong>问：payload 不经过 CPU，是否已经使用 IBGDA？</strong> 不足以判断。还要看 WQE 谁构造、谁通知 NIC；proxy 路径也可使用 NIC 直接读取 GPU 数据。</p>
+<p><strong>问：ready 到 14，是否表示远端已有 14 个 token？</strong> 不是。ready 是 WQE 发布前缀，token 与 WQE 数也未必一比一。远端消费由应用通知协议决定。</p>
+<p><strong>问：每个 channel 一个 QP，为什么还要 head/tail？</strong> QP 处理网络工作队列；head/tail 处理应用 ring 的容量与消费进度。NIC 完成传输不意味着下游已读完环形槽。</p>
+<p><strong>问：为什么不能只在末尾放一个任意 QP 的 flag？</strong> 本地程序顺序不能自动建立独立 QP 间的远端发布顺序。要按实际 transport/API 保证设计排序链，不能从源码表面相邻两行推出完成保证。</p>
+<h2 id="14-源码阅读清单与参考"><a class="heading-link" href="#14-源码阅读清单与参考">14. 源码阅读清单与参考</a></h2>
+<p>按顺序打开：<a href="source-c6e5d87e7bd1b888.html#L105"><code>legacy.py</code></a> → <a href="source-18b1208d0de8c03b.html#L255"><code>buffer.hpp</code></a> → <a href="source-1ad22e34baf9bc32.html#L46"><code>nvshmem.cu</code></a> → <a href="source-4ac4b10b9bd1d873.html#L81"><code>ibgda_device.cuh</code></a> → <a href="source-b40af34d5f05ac40.html#L253"><code>internode_ll.cu</code></a>。</p>
+<p>外部资料用途：NVIDIA 2022 原理文章用于控制面概念；NVSHMEM ordering 用于公共 API 边界；具体变量、布局和 DeepEP 协议以本地源码为准。继续阅读 <a href="tutorial-nvshmem-deployment.html">CPU-assisted IBGDA 与部署教程</a>，然后在 <a href="index.html">六篇目录</a> 选择 normal 或 LL 路线。</p>
+</article><nav class="pager" aria-label="前后篇"><a href="index.html">← 阅读总目录</a><a href="tutorial-nvshmem-deployment.html">CPU-assisted 与 NVSHMEM →</a></nav><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#1-入门先回答三个问题">1. 入门先回答三个问题</a><a class="level-2" href="#2-gpudirect-rdma-与-ibgda-分别解决什么">2. GPUDirect RDMA 与 IBGDA 分别解决什么</a><a class="level-2" href="#3-先把术语放回物理对象">3. 先把术语放回物理对象</a><a class="level-2" href="#4-代码框图应用层怎样到达设备队列">4. 代码框图：应用层怎样到达设备队列</a><a class="level-2" href="#5-源码精读一pe-与-qp-的坐标">5. 源码精读一：PE 与 QP 的坐标</a><a class="level-2" href="#6-源码精读二地址翻译与分块">6. 源码精读二：地址翻译与分块</a><a class="level-2" href="#7-源码精读三wqe-里到底写什么">7. 源码精读三：WQE 里到底写什么</a><a class="level-2" href="#8-源码精读四warp-合作与无空洞发布">8. 源码精读四：warp 合作与无空洞发布</a><a class="level-2" href="#9-发布完成消费必须分别证明">9. 发布、完成、消费必须分别证明</a><a class="level-2" href="#10-deepep-的三种实际搬运形式">10. DeepEP 的三种实际搬运形式</a><a class="level-2" href="#11-性能怎样分析才不会只看链路带宽">11. 性能怎样分析才不会只看链路带宽</a><a class="level-2" href="#12-从零开始的四次学习练习">12. 从零开始的四次学习练习</a><a class="level-2" href="#13-自测与答案">13. 自测与答案</a><a class="level-2" href="#14-源码阅读清单与参考">14. 源码阅读清单与参考</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

@@ -1,0 +1,7 @@
+{
+  "name": "deepep-reading-docs",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {"build": "node build-docs.cjs", "check": "node check-docs.cjs"},
+  "dependencies": {"marked": "17.0.5", "playwright": "1.62.1"}
+}

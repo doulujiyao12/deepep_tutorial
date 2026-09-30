@@ -1,0 +1,308 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="从 communicator、window、team、context 到 put、signal、flush 的语义边界。"><title>NCCL Device API 与 GIN · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link " href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link " href="tutorial-ibgda-principles.html" ><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link " href="tutorial-nvshmem-deployment.html" ><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link active" href="tutorial-nccl-device-gin.html" aria-current="page"><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">基础 · 窗口与拓扑 · 05 / 06</div><h1>NCCL Device API 与 GIN</h1><p>从 communicator、window、team、context 到 put、signal、flush 的语义边界。</p><div class="chips"><span class="chip">17 分钟参考阅读</span><span class="chip">14 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><section class="learning"><h2>本篇阅读任务</h2><p>选一个 team peer，手算 window offset，再跟踪通知如何证明目标数据可见。</p><details><summary>读后自检：为什么发送端 flush 不能替代接收端等待？</summary><p>对 put，flush 只保证本地输入被消费。接收方的数据可见性依赖正确的 signal 或更完整的同步协议。</p></details></section><article class="article"><h1 id="nccl-device-api-与-gin从通信对象到-deepep-v2"><a class="heading-link" href="#nccl-device-api-与-gin从通信对象到-deepep-v2">NCCL Device API 与 GIN：从通信对象到 DeepEP V2</a></h1>
+<blockquote>
+<p>基础篇 C · 目标：理解 communicator、window、team、context 和完成语义，沿代码解释 V2 的 direct/hybrid 路径，并知道哪些接口受版本影响。</p>
+</blockquote>
+<p>研究日期：2026-09-23。DeepEP 代码以本地 <code>01dc3aaac82068020353dce2c302e38153c0bfaa</code> 源码基线为准；访问时 NCCL 在线文档标识为 <strong>2.31.2</strong>。本篇同时链接 2.30.7 归档，用于核对项目使用的接口。在线最新指南不代表本地二进制已经升级。</p>
+<p><a href="index.html">六篇目录</a> · <a href="tutorial-ibgda-principles.html">前置：IBGDA</a> · <a href="implementation-v2-elastic.html">对应实现：V2 Elastic</a></p>
+<h2 id="1-从熟悉的-nccl-host-collective-出发"><a class="heading-link" href="#1-从熟悉的-nccl-host-collective-出发">1. 从熟悉的 NCCL host collective 出发</a></h2>
+<p>常见训练代码在 host 上调用 NCCL collective，由库安排通信 kernel。Device API 则允许自定义 CUDA kernel 使用 NCCL 提供的通信资源。要理解 DeepEP V2，先分清“通信算法由谁组织”和“网络资源由谁提供”：V2 自己编排 token 路由、队列与规约，NCCL 提供 communicator、注册窗口、可访问域及 GIN 接口。<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html" target="_blank" rel="noopener noreferrer">官方入口</a></p>
+<p>这使通信可以和 routing、pack、TMA、reduce 放进同一套设备端执行流程，但不会自动消除所有 SM 成本。V2 的 resource 估算、warp 分工与 epilogue 仍然需要阅读实际代码。</p>
+<h2 id="2-三种实现抽象放在同一张表"><a class="heading-link" href="#2-三种实现抽象放在同一张表">2. 三种实现抽象放在同一张表</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层次</th>
+<th>V1 normal</th>
+<th>V1 Low-Latency</th>
+<th>V2 Elastic</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>应用入口</td>
+<td><code>Buffer.dispatch/combine</code></td>
+<td><code>low_latency_dispatch/combine</code></td>
+<td><code>ElasticBuffer.dispatch/combine</code></td>
+</tr>
+<tr>
+<td>地址模型</td>
+<td>IPC peer pointer + NVSHMEM heap</td>
+<td>全局 PE 的 heap + P2P bypass</td>
+<td>NCCL window + offset + team peer</td>
+</tr>
+<tr>
+<td>网络接口</td>
+<td>DeepEP IBGDA helper</td>
+<td>同一个 IBGDA helper</td>
+<td><code>handle::NCCLGin</code> 封装</td>
+</tr>
+<tr>
+<td>队列粒度</td>
+<td>channel/chunk/ring</td>
+<td>expert/source 固定槽</td>
+<td>direct 或 hybrid 的 slot、队列与 context</td>
+</tr>
+<tr>
+<td>GPU 调度</td>
+<td>常驻通信 blocks</td>
+<td>SEND/RECV 可拆</td>
+<td>主通信 kernel 与 epilogue</td>
+</tr>
+<tr>
+<td>集成方向</td>
+<td>吞吐优化</td>
+<td>decode overlap</td>
+<td>统一 EP 模式与更灵活拓扑</td>
+</tr>
+</tbody></table></div>
+<p>本表依据三篇本地实现解析及对应源码。GIN 不等于 NVSHMEM IBGDA：API 与资源管理不同，底层却可以采用相关的 GPU 驱动 NIC 技术。接口抽象与物理后端应分别研究。</p>
+<h2 id="3-核心对象先看-host再看-device"><a class="heading-link" href="#3-核心对象先看-host再看-device">3. 核心对象：先看 host，再看 device</a></h2>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-5b5fab0251b09519.svg" target="_blank"><img src="assets/diagram-5b5fab0251b09519.svg" alt="流程图：NCCL Device API 与 GIN" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-5b5fab0251b09519.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart LR
+  A[Host ncclComm_t] --&gt; B[查询 properties]
+  B --&gt; C[填写 device requirements]
+  C --&gt; D[ncclDevCommCreate]
+  A --&gt; E[分配 symmetric memory]
+  E --&gt; F[注册 ncclWindow]
+  D --&gt; G[CUDA kernel 参数]
+  F --&gt; G
+  G --&gt; H[handle::NCCLGin]
+  H --&gt; I[LSA pointer load/store]
+  H --&gt; J[GIN put/get/signal]</code></pre></details></figure><div class="table-wrap"><table>
+<thead>
+<tr>
+<th>对象</th>
+<th>在项目中负责什么</th>
+<th>阅读位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>host communicator</td>
+<td>rank/world、bootstrap 和资源生命周期</td>
+<td><a href="source-3a37eef0e0422a3d.html#L26"><code>nccl.cu</code></a></td>
+</tr>
+<tr>
+<td>device communicator</td>
+<td>kernel 可用的团队与通信资源</td>
+<td><a href="source-3a37eef0e0422a3d.html#L82"><code>nccl.cu</code></a></td>
+</tr>
+<tr>
+<td>window</td>
+<td>已注册地址范围及设备映射</td>
+<td><a href="source-3a37eef0e0422a3d.html#L129"><code>nccl.cu</code></a></td>
+</tr>
+<tr>
+<td>team</td>
+<td>peer 编号的坐标域</td>
+<td><a href="source-9012571458d2480d.html#L11"><code>handle.cuh</code></a></td>
+</tr>
+<tr>
+<td>context</td>
+<td>GIN 操作使用的资源上下文</td>
+<td><a href="source-9012571458d2480d.html#L25"><code>NCCLGin</code> 构造</a></td>
+</tr>
+<tr>
+<td>signal/counter</td>
+<td>远端通知与本地完成相关状态</td>
+<td><a href="source-67dca3271af53040.html#L129"><code>comm.cuh</code></a></td>
+</tr>
+</tbody></table></div>
+<h2 id="4-源码精读一能力查询和资源申请"><a class="heading-link" href="#4-源码精读一能力查询和资源申请">4. 源码精读一：能力查询和资源申请</a></h2>
+<p>来自 <a href="source-3a37eef0e0422a3d.html#L82"><code>NCCLSymmetricMemoryContext</code></a>，省略失败信息与个别资源字段：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp">ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
+<span class="hljs-built_in">NCCL_CHECK</span>(<span class="hljs-built_in">ncclCommQueryProperties</span>(comm, &amp;props));
+ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+<span class="hljs-keyword">if</span> (num_ranks &gt; <span class="hljs-number">1</span> <span class="hljs-keyword">and</span> <span class="hljs-built_in">get_env</span>(<span class="hljs-string">&quot;EP_DISABLE_GIN&quot;</span>, <span class="hljs-number">0</span>) == <span class="hljs-number">0</span>) {
+    <span class="hljs-comment">// ... 检查 props.ginType 或 props.railedGinType ...</span>
+    reqs.ginContextCount = num_allocated_qps;
+    reqs.ginExclusiveContexts = <span class="hljs-literal">true</span>;
+    reqs.ginQueueDepth = kGinQPDepth;
+    reqs.ginTrafficClass = sl_idx;
+    reqs.ginSignalCount = num_ranks + <span class="hljs-number">2</span> * <span class="hljs-number">2</span>;
+    reqs.ginConnectionType = allow_hybrid_mode
+        ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_FULL;
+}</code></pre></div>
+<p><code>props</code> 回答系统提供什么，<code>reqs</code> 描述 kernel 要用什么。context count 与信号数量必须覆盖实际 kernel 的使用范围。<code>ginExclusiveContexts</code> 表达资源共享要求；不能把增加 context 当作没有成本的调参。</p>
+<p><code>EP_DISABLE_GIN</code> 跳过申请，不提供另一套跨节点算法。<code>allow_hybrid_mode</code> 会同时影响拓扑、peer 坐标与连接类型；在不支持 FULL 可达性的网络上直接关闭 hybrid，可能初始化失败。</p>
+<h3 id="41-编译版本与运行版本"><a class="heading-link" href="#41-编译版本与运行版本">4.1 编译版本与运行版本</a></h3>
+<p>同一文件中的 <code>#if NCCL_VERSION_CODE &gt;= NCCL_VERSION(2, 31, 0)</code> 分支设置 <code>useRuntimeVersion</code> 并按运行时尺寸分配 device communicator；旧分支检查编译与运行 NCCL 版本相同。这个分支是项目做的兼容处理，不是所有 device kernel 任意跨版本兼容的证明。<a href="source-3a37eef0e0422a3d.html#L99">实际代码</a></p>
+<p>升级实验至少记录 host 编译头文件、device 编译/JIT 使用头文件、加载的 <code>libnccl</code> 和缓存是否重建。GIN 内部结构被直接访问时，尤其要复核这些边界。</p>
+<h2 id="5-源码精读二注册窗口和对称偏移"><a class="heading-link" href="#5-源码精读二注册窗口和对称偏移">5. 源码精读二：注册窗口和对称偏移</a></h2>
+<p>项目先分配自己的 symmetric memory，再注册窗口，而非直接复制官方示例的分配方式。<a href="source-3a37eef0e0422a3d.html#L129">源码</a></p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-keyword">this</span>-&gt;symmetric_memory = symmetric::<span class="hljs-built_in">alloc</span>(
+    num_bytes - num_cpu_bytes, num_cpu_bytes,
+    allow_hybrid_mode, num_scaleup_ranks, scaleout_rank_idx,
+    cpu_comm);
+raw_window_ptr = <span class="hljs-keyword">this</span>-&gt;symmetric_memory-&gt;ptr;
+<span class="hljs-built_in">NCCL_CHECK</span>(<span class="hljs-built_in">ncclCommWindowRegister</span>(
+    comm, raw_window_ptr, <span class="hljs-keyword">this</span>-&gt;symmetric_memory-&gt;num_bytes,
+    &amp;window, NCCL_WIN_STRICT_ORDERING));
+<span class="hljs-built_in">NCCL_CHECK</span>(<span class="hljs-built_in">ncclGetLsaDevicePointer</span>(window, <span class="hljs-number">0</span>, nvl_rank_idx,
+                                &amp;mapped_window_ptr));</code></pre></div>
+<p>第一段区分 GPU 与 CPU 容量；第二段让窗口覆盖实际分配区；第三段获取当前 LSA 视角的映射。项目注释说明 window registration 是 collective，所以必须协调各 rank 的调用顺序。</p>
+<p><code>NCCL_WIN_STRICT_ORDERING</code> 与项目使用的 VA signal 有关联，但它不会自动给任意裸指针写提供应用层完成协议。通信正确性还依赖后文的 put、通知和等待。</p>
+<h2 id="6-worldlsarail-与-fullrail"><a class="heading-link" href="#6-worldlsarail-与-fullrail">6. World、LSA、Rail 与 FULL/RAIL</a></h2>
+<p>DeepEP 从 NCCL 的 LSA 大小计算物理域：<code>num_rdma_ranks = num_ranks / num_nvl_ranks</code>。这里的前者表示域的数量，不是 NIC 的数量。<a href="source-3a37eef0e0422a3d.html#L49">源码</a></p>
+<p>以下用 2 个域、每域 4 个 rank 做教学示例，假定连续 rank 排布满足项目断言：</p>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-02c870f6836399eb.svg" target="_blank"><img src="assets/diagram-02c870f6836399eb.svg" alt="流程图：NCCL Device API 与 GIN" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-02c870f6836399eb.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart LR
+  subgraph L0[LSA 域 0]
+    A0[rank 0] --- A1[rank 1]
+    A1 --- A2[rank 2]
+    A2 --- A3[rank 3]
+  end
+  subgraph L1[LSA 域 1]
+    B0[rank 4] --- B1[rank 5]
+    B1 --- B2[rank 6]
+    B2 --- B3[rank 7]
+  end
+  A0 -. Rail 0 .-&gt; B0
+  A1 -. Rail 1 .-&gt; B1
+  A2 -. Rail 2 .-&gt; B2
+  A3 -. Rail 3 .-&gt; B3</code></pre></details></figure><p>rank 2 的 LSA peer 1 是全局 rank 1；在它的 rail 中，peer 1 则对应全局 rank 6。同一个整数必须带着 team 解读。真实机器是否满足这种排布由初始化查询与断言决定，不能只凭服务器 hostname 推定 LSA。</p>
+<p>FULL 允许需要的全互联 peer 路径；RAIL 约束跨域同 rail 通信，域内再 fan-out。V2 direct 将逻辑 scale-up 扩成 world，并按指针可达性选择路径；hybrid 保留两级逻辑域。<a href="source-3a37eef0e0422a3d.html#L56">逻辑域代码</a></p>
+<h2 id="7-源码精读三一次-gin-put-的参数"><a class="heading-link" href="#7-源码精读三一次-gin-put-的参数">7. 源码精读三：一次 GIN put 的参数</a></h2>
+<p><a href="source-9012571458d2480d.html#L175"><code>handle::NCCLGin::put</code></a> 把指针改写成 window offset，主要实参如下：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp">gin.<span class="hljs-built_in">put</span>(<span class="hljs-built_in">TEAM_WORLD_RAIL</span>(),
+        dst_rank_idx,
+        nccl_window, <span class="hljs-built_in">reinterpret_cast</span>&lt;<span class="hljs-type">int64_t</span>&gt;(recv_sym_ptr) - lsa_base_ptr,
+        nccl_window, <span class="hljs-built_in">reinterpret_cast</span>&lt;<span class="hljs-type">int64_t</span>&gt;(send_sym_ptr) - lsa_base_ptr,
+        num_bytes,
+        remote_action,
+        <span class="hljs-built_in">ncclGin_None</span>(),
+        <span class="hljs-built_in">ncclCoopThread</span>(),
+        <span class="hljs-built_in">ncclGin_None</span>(),
+        cuda::thread_scope_thread,
+        cuda::thread_scope_device,
+        ncclGinOptFlagsDefault | extra_options);</code></pre></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>参数组</th>
+<th>代码含义</th>
+<th>阅读检查点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>team + peer</td>
+<td>在 world 或 rail 内选择目标</td>
+<td>peer 编号是否属于该 team</td>
+</tr>
+<tr>
+<td>remote window + offset</td>
+<td>目标在注册区内的位置</td>
+<td>是否越过 token/slot 边界</td>
+</tr>
+<tr>
+<td>local window + offset</td>
+<td>NIC 消费的源位置</td>
+<td>source buffer 是否过早复用</td>
+</tr>
+<tr>
+<td>bytes</td>
+<td>本次传输长度</td>
+<td>是否包含 metadata/scale/padding</td>
+</tr>
+<tr>
+<td>remote action</td>
+<td>数据关联的远端通知</td>
+<td>默认 <code>None</code> 时通知在哪里建立</td>
+</tr>
+<tr>
+<td>coop / scope</td>
+<td>参与线程与内存作用域</td>
+<td>是否真的满足发布前提</td>
+</tr>
+</tbody></table></div>
+<p>函数注释提示，通过此 put API 发本地/NVLink 数据也会经过 NIC。V2 为此先尝试 <code>get_sym_ptr</code>，对可直接访问的 peer 使用另一条 load/store/TMA 路径。不能认为 <code>gin.put</code> 自动等价于最优 NVLink copy。</p>
+<h2 id="8-完成语义用四个问题检查协议"><a class="heading-link" href="#8-完成语义用四个问题检查协议">8. 完成语义：用四个问题检查协议</a></h2>
+<p>先问：请求是否已提交？再问：源 buffer 是否可复用？随后问：远端 payload 是否可见？最后问：所有参与者是否已到达算法边界？这四件事分别需要证据。</p>
+<p><code>flush</code> 对 put 保证本地输入被消费，不承诺远端完成。附着在 put 上的 signal 可用于确认相应数据可见；strong signal 还覆盖同 peer、同 context 的前序 put，weak signal 的覆盖更窄。旧 signal 类型的行为与 communicator 配置有关。<a href="https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2307/user-guide/docs/api/device_gin.html" target="_blank" rel="noopener noreferrer">GIN 2.30.7</a> · <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/device_gin.html" target="_blank" rel="noopener noreferrer">GIN 当前参考</a></p>
+<p>下面是教学状态图，不是替代 API 的可编译代码：</p>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-7277c3023db6a1bd.svg" target="_blank"><img src="assets/diagram-7277c3023db6a1bd.svg" alt="流程图：NCCL Device API 与 GIN" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-7277c3023db6a1bd.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>stateDiagram-v2
+  [*] --&gt; Prepared: 源数据写好
+  Prepared --&gt; Issued: 提交 put
+  Issued --&gt; SourceReusable: 本地完成机制
+  Issued --&gt; RemoteVisible: 正确的远端通知协议
+  RemoteVisible --&gt; Consumed: 接收方处理
+  SourceReusable --&gt; NextSend: 源槽可供下一次发送
+  Consumed --&gt; Recyclable: 归还应用层 credit</code></pre></details></figure><p>两条分支强调源槽与目标槽有独立生命周期。网络完成也不等于接收端的 GEMM 已结束。设计 ring 时必须让消费者显式归还 credit，不能用发送方的 flush 代替。</p>
+<h2 id="9-源码精读四deepep-的自定义-barrier"><a class="heading-link" href="#9-源码精读四deepep-的自定义-barrier">9. 源码精读四：DeepEP 的自定义 barrier</a></h2>
+<p><a href="source-67dca3271af53040.html#L129"><code>gin_barrier_wo_local_sync</code></a> 将完成协议分成若干阶段：各 warp flush 分配给自己的 context；必要时执行 system fence；grid/CTA 汇合；使用 QP 0 发送 barrier signal；接收方等待每个来源的目标值。</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-keyword">for</span> (<span class="hljs-type">int</span> i = global_warp_idx; i &lt; num_qps; i += kNumSMs * kNumWarps) {
+    <span class="hljs-built_in">ncclGin</span>(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA)
+        .<span class="hljs-built_in">flush</span>(<span class="hljs-built_in">ncclCoopWarp</span>());
+}
+<span class="hljs-comment">// ... system fence、grid 同步以及 barrier signal 发布 ...</span>
+<span class="hljs-type">const</span> <span class="hljs-keyword">auto</span> gdaki = <span class="hljs-built_in">static_cast</span>&lt;<span class="hljs-keyword">struct</span> ncclGinGdakiGPUContext*&gt;(
+    gin._ginHandle) + gin.contextId;</code></pre></div>
+<p>它随后读取 GDAKI 内部 signals table，并用 <code>timeout_while</code> 实现超时诊断。由此可以确认：当前源码的这条等待路径耦合 GDAKI 内部布局。即使 host 只检查 GIN 不为 NONE，也不能直接宣称 Proxy 后端可运行整个 V2。</p>
+<p>这一段应当按完整协议审查，特别关注多 context 的 flush、signal 类型和版本保证如何组合。单独摘一句 <code>flush</code> 然后写成“所有远端已完成”会丢掉核心条件。研究修改时要一起检查 <a href="source-67dca3271af53040.html#L213"><code>gpu_barrier</code></a> 的首尾同步和调用者资源范围。</p>
+<h2 id="10-如何对应-v2-direct-与-hybrid"><a class="heading-link" href="#10-如何对应-v2-direct-与-hybrid">10. 如何对应 V2 direct 与 hybrid</a></h2>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-0c1ea56c57f6a81c.svg" target="_blank"><img src="assets/diagram-0c1ea56c57f6a81c.svg" alt="流程图：NCCL Device API 与 GIN" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-0c1ea56c57f6a81c.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart TB
+  A[输入 hidden 与 top-k] --&gt; B{direct 或 hybrid}
+  B --&gt;|direct| C[按目标 rank 分配 slot]
+  C --&gt; D{目标有直接对称指针}
+  D --&gt;|有| E[域内 copy / TMA]
+  D --&gt;|无| F[World GIN put]
+  B --&gt;|hybrid| G[先按目标域组织消息]
+  G --&gt; H[Rail GIN put]
+  H --&gt; I[目标域 NVLink fan-out]
+  E --&gt; J[完成协议与 copy epilogue]
+  F --&gt; J
+  I --&gt; J
+  J --&gt; K[expert 计算]
+  K --&gt; L[combine 通信及 reduce epilogue]</code></pre></details></figure><p>**Direct：**阅读 <a href="source-59b9fe79ae592e57.html#L277"><code>dispatch.cuh</code></a>。一个 token 先获得目标槽，再按地址可达性选择写法。主路径的 put 可以没有附着 signal，最终以末尾 barrier 等协议完成；不能在图里擅自给每个 put 加 signal。</p>
+<p>**Hybrid：**阅读 <a href="source-0c930c18c256cc88.html#L444"><code>hybrid_dispatch.cuh</code></a>。跨域消息通过 rail，目标域内再分发。收益来自减少重复跨域数据与配合网络拓扑，代价包括中间缓冲、队列状态和转发工作。</p>
+<p>**Combine：**阅读 <a href="source-2911d6fb144f8bf4.html#L121"><code>combine.cuh</code></a> 与 <a href="source-4d9ae37fea764832.html"><code>combine_reduce_epilogue.cuh</code></a>。输入布局和 <code>allow_multiple_reduction</code> 决定部分和在哪里形成；尾部 epilogue 把通信区结果规约到用户输出。这不是把 dispatch 箭头倒过来就能解释的过程。</p>
+<h2 id="11-jittma-与-stream-如何接上"><a class="heading-link" href="#11-jittma-与-stream-如何接上">11. JIT、TMA 与 stream 如何接上</a></h2>
+<p>V2 的 host launcher 把 hidden、拓扑、模式、SM/QP 等转成模板实例。编译缓存减少重复编译，第一次调用成本应与稳态通信性能分开。<a href="source-38a14486389e16c7.html">JIT 编译器</a> · <a href="source-58ff6c43f5392c9d.html">launch runtime</a></p>
+<p>TMA 是数据搬运机制，GIN 是网络通信接口，两者在 staging 和 epilogue 中配合。TMA copy 完成需要相应 barrier/proxy 同步；不能把 CUDA stream 上的 launch 顺序当成 kernel 内全部异步 copy 已完成的证明。具体顺序见 <a href="implementation-v2-elastic.html">V2 实现正文</a>。</p>
+<p><code>stream_control_prologue/epilogue</code> 管理调用者 stream 与通信 stream 的依赖、事件以及 tensor 生命周期。通信完成事件和 PyTorch allocator 的 <code>record_stream</code> 解决不同问题：一个决定何时能用结果，另一个防止存储过早回收。<a href="source-1f36faad5f2102cb.html">C++ 编排</a></p>
+<h2 id="12-从哪里入门分三个小实验"><a class="heading-link" href="#12-从哪里入门分三个小实验">12. 从哪里入门：分三个小实验</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>实验</th>
+<th>只改变什么</th>
+<th>先检查什么</th>
+<th>从哪里读</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>LSA 基础</td>
+<td>小规模域内通信</td>
+<td>pointer/offset 与输出正确性</td>
+<td><code>handle.cuh</code> 的 <code>get_sym_ptr</code></td>
+</tr>
+<tr>
+<td>direct 对 hybrid</td>
+<td><code>allow_hybrid_mode</code>，硬件须支持</td>
+<td>连接能力、rank 坐标、同路由输出</td>
+<td><code>nccl.cu</code> 与两种 dispatch</td>
+</tr>
+<tr>
+<td>resource 扫描</td>
+<td>一次只改变 SM 或 QP</td>
+<td>申请资源不少于使用资源，结果不变</td>
+<td><code>elastic.py</code> 估算和测试参数</td>
+</tr>
+</tbody></table></div>
+<p>先看 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html" target="_blank" rel="noopener noreferrer">官方 Device API 学习入口</a> 的 LSA 示例理解 window，再读本篇代码。之后运行项目现有测试，而不是从复杂 MoE pipeline 开始排障。</p>
+<p>以下是已配置 Linux 八 GPU 节点上、仓库根目录的正确性检查示例。参数来自 <a href="source-a9bdbc95bc560e6e.html#L565">测试 parser</a>：</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">python tests/elastic/test_ep.py --num-processes 8 --num-tokens 128 --hidden 7168 --num-topk 6 --num-experts 256 --skip-perf-test --test-first-only</code></pre></div>
+<p>它只覆盖选定的首个 case，不是完整回归测试。后续去掉 <code>--test-first-only</code> 扩大正确性覆盖，再开启性能测量；比较时固定 token、top-k、expert 分布、dtype、cache 模式和输出布局。</p>
+<h2 id="13-六个容易读错的细节"><a class="heading-link" href="#13-六个容易读错的细节">13. 六个容易读错的细节</a></h2>
+<ol>
+<li><strong>LSA 不等于一台传统服务器。</strong> 它是 NCCL 查询出的可直接访问域，项目按域大小构造逻辑坐标。</li>
+<li><strong>context 不应直接理解成一块物理 NIC。</strong> 软件资源索引与硬件映射由后端决定。</li>
+<li><strong><code>do_cpu_sync=False</code> 不提供真实 host token 数。</strong> 部分输出尺寸是容量，GPU metadata 才描述有效数据。</li>
+<li><strong>GIN <code>put</code> 默认没有 remote action。</strong> 必须继续追踪完成通知在哪里发生。</li>
+<li><strong>V2 的 low-latency 定位不等于保留 V1 recv hook。</strong> 主 kernel 和 epilogue 的调度方式不同。</li>
+<li><strong>新版本官方 API 不自动覆盖旧实现。</strong> 强弱 signal、运行时 communicator 尺寸和私有结构访问都要按版本核对。</li>
+</ol>
+<p>以上可在 <a href="implementation-v2-elastic.html">V2 完整实现文档</a> 的 EPHandle、barrier、代码索引与模式对照章节进一步验证。</p>
+<h2 id="14-自测与继续研究"><a class="heading-link" href="#14-自测与继续研究">14. 自测与继续研究</a></h2>
+<p><strong>问：什么时候使用 <code>ncclTeamTagRail</code>？</strong> 当算法按同 rail 的跨域连接寻址，且资源申请为对应连接类型时。peer 必须用该 team 的坐标。</p>
+<p><strong>问：为什么发送端 flush 后接收端仍要等待？</strong> flush 的本地完成不足以证明接收端数据已经可见；接收方还要遵守远端通知协议。</p>
+<p><strong>问：如何证明 V2 在目标环境使用哪种 backend？</strong> 结合 properties、初始化日志和实际 kernel 路径；还要检查自定义等待对 GDAKI 的依赖。</p>
+<p><strong>问：如何判断一次优化有效？</strong> 在相同正确性语义与形状下，把 JIT、初始化、steady-state 通信及完整 MoE 迭代分别计时，报告资源和误差范围。</p>
+<p>建议阅读顺序：<a href="source-3a37eef0e0422a3d.html"><code>nccl.cu</code></a> → <a href="source-9012571458d2480d.html"><code>handle.cuh</code></a> → <a href="source-67dca3271af53040.html"><code>comm.cuh</code></a> → direct/hybrid kernel → epilogue → <a href="source-a9bdbc95bc560e6e.html"><code>test_ep.py</code></a>。Host setup 的公共契约见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/device_setup.html" target="_blank" rel="noopener noreferrer">NCCL 官方参考</a>。</p>
+</article><nav class="pager" aria-label="前后篇"><a href="implementation-v1-low-latency.html">← V1 Low-Latency</a><a href="implementation-v2-elastic.html">V2 Elastic →</a></nav><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#1-从熟悉的-nccl-host-collective-出发">1. 从熟悉的 NCCL host collective 出发</a><a class="level-2" href="#2-三种实现抽象放在同一张表">2. 三种实现抽象放在同一张表</a><a class="level-2" href="#3-核心对象先看-host再看-device">3. 核心对象：先看 host，再看 device</a><a class="level-2" href="#4-源码精读一能力查询和资源申请">4. 源码精读一：能力查询和资源申请</a><a class="level-3" href="#41-编译版本与运行版本">4.1 编译版本与运行版本</a><a class="level-2" href="#5-源码精读二注册窗口和对称偏移">5. 源码精读二：注册窗口和对称偏移</a><a class="level-2" href="#6-worldlsarail-与-fullrail">6. World、LSA、Rail 与 FULL/RAIL</a><a class="level-2" href="#7-源码精读三一次-gin-put-的参数">7. 源码精读三：一次 GIN put 的参数</a><a class="level-2" href="#8-完成语义用四个问题检查协议">8. 完成语义：用四个问题检查协议</a><a class="level-2" href="#9-源码精读四deepep-的自定义-barrier">9. 源码精读四：DeepEP 的自定义 barrier</a><a class="level-2" href="#10-如何对应-v2-direct-与-hybrid">10. 如何对应 V2 direct 与 hybrid</a><a class="level-2" href="#11-jittma-与-stream-如何接上">11. JIT、TMA 与 stream 如何接上</a><a class="level-2" href="#12-从哪里入门分三个小实验">12. 从哪里入门：分三个小实验</a><a class="level-2" href="#13-六个容易读错的细节">13. 六个容易读错的细节</a><a class="level-2" href="#14-自测与继续研究">14. 自测与继续研究</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

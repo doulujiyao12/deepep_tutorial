@@ -1,0 +1,337 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="比较三种控制面，连接初始化、部署验证与可复现的研究方法。"><title>CPU-assisted 与 NVSHMEM · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link " href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link " href="tutorial-ibgda-principles.html" ><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link active" href="tutorial-nvshmem-deployment.html" aria-current="page"><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link " href="tutorial-nccl-device-gin.html" ><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">基础 · 部署与实验 · 02 / 06</div><h1>CPU-assisted 与 NVSHMEM</h1><p>比较三种控制面，连接初始化、部署验证与可复现的研究方法。</p><div class="chips"><span class="chip">16 分钟参考阅读</span><span class="chip">13 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><section class="learning"><h2>本篇阅读任务</h2><p>从 Python 环境变量跟到 C++ bootstrap，再从运行证据确认 handler 和 P2P 路径。</p><details><summary>读后自检：CPU-assisted 与普通 CPU proxy 的关键区别是什么？</summary><p>CPU-assisted 中 GPU 生成 NIC work request，CPU 主要辅助 doorbell；普通 proxy 的逐消息工作请求由 CPU transport 生成。</p></details></section><article class="article"><h1 id="cpu-assisted-ibgda-与-deepep-nvshmem原理部署和实验"><a class="heading-link" href="#cpu-assisted-ibgda-与-deepep-nvshmem原理部署和实验">CPU-assisted IBGDA 与 DeepEP NVSHMEM：原理、部署和实验</a></h1>
+<blockquote>
+<p>基础篇 B · 建议在 IBGDA 原理之后阅读 · 目标：理解三种控制面实现，知道 DeepEP 初始化了什么，并能设计有证据的部署检查与对照实验。</p>
+</blockquote>
+<p>研究日期：2026-09-23。项目源码基线：<code>01dc3aaac82068020353dce2c302e38153c0bfaa</code>。本篇将 NVIDIA NVSHMEM 3.0 的 CPU-assisted 文章与项目 <code>docs/nvshmem.md</code> 合并讲解。配置要求以目标软件版本和机器为准；下文 Linux 命令是供集群执行的教程，编写时没有修改驱动或运行集群测试。</p>
+<p><a href="index.html">六篇总目录</a> · <a href="tutorial-ibgda-principles.html">前一篇：IBGDA 原理</a> · <a href="implementation-v1-sm.html">V1 SM</a> · <a href="implementation-v1-low-latency.html">V1 LL</a></p>
+<h2 id="1-为什么还需要-cpu-assisted-模式"><a class="heading-link" href="#1-为什么还需要-cpu-assisted-模式">1. 为什么还需要 CPU-assisted 模式</a></h2>
+<p>traditional IBGDA 需要 GPU 能够访问相应 NIC 控制资源。某些部署无法方便地满足映射或管理配置要求。CPU-assisted 保留 GPU 生成 work request，把 NIC doorbell 辅助交给 CPU，因此可以放宽部分部署限制。这是 NVSHMEM 3.0 引入的中间模式。<a href="https://developer.nvidia.com/blog/?p=88550" target="_blank" rel="noopener noreferrer">NVIDIA 原文</a></p>
+<p>对 DeepEP 读者最重要的问题是：GPU 是否仍在构造 WQE，以及提交进度由谁推进。只看到 CPU 线程活跃，无法认定系统退回了普通 proxy；同样，设置 <code>NVSHMEM_IB_ENABLE_IBGDA=1</code> 也不能单独证明 GPU 正在直接写 doorbell。</p>
+<h2 id="2-三种实现的职责对照"><a class="heading-link" href="#2-三种实现的职责对照">2. 三种实现的职责对照</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>职责</th>
+<th>普通 CPU proxy</th>
+<th>CPU-assisted IBGDA</th>
+<th>traditional IBGDA</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GPU 提出通信意图</td>
+<td>是</td>
+<td>是</td>
+<td>是</td>
+</tr>
+<tr>
+<td>生成 NIC work request</td>
+<td>CPU transport</td>
+<td>GPU</td>
+<td>GPU</td>
+</tr>
+<tr>
+<td>发布待处理前缀</td>
+<td>proxy 自身队列协议</td>
+<td>GPU 发布 producer index</td>
+<td>GPU 发布 ready 前缀</td>
+</tr>
+<tr>
+<td>NIC doorbell</td>
+<td>CPU</td>
+<td>CPU helper</td>
+<td>GPU</td>
+</tr>
+<tr>
+<td>传输 payload</td>
+<td>NIC DMA</td>
+<td>NIC DMA</td>
+<td>NIC DMA</td>
+</tr>
+<tr>
+<td>host 初始化</td>
+<td>仍需要</td>
+<td>仍需要</td>
+<td>仍需要</td>
+</tr>
+<tr>
+<td>典型取舍</td>
+<td>控制面兼容性与 CPU 请求率</td>
+<td>部署弹性与 helper 延迟</td>
+<td>GPU 直接控制与映射要求</td>
+</tr>
+</tbody></table></div>
+<p>此表中 proxy/traditional 的概念来自 <a href="https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/" target="_blank" rel="noopener noreferrer">NVIDIA IBGDA 原理</a>，CPU-assisted 职责来自上面的 NVSHMEM 3.0 文章；DeepEP 两分支的代码证据见第 4 节。</p>
+<h2 id="3-从初始化到每条消息的代码框图"><a class="heading-link" href="#3-从初始化到每条消息的代码框图">3. 从初始化到每条消息的代码框图</a></h2>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-f8aa49970622dc56.svg" target="_blank"><img src="assets/diagram-f8aa49970622dc56.svg" alt="流程图：CPU-assisted 与 NVSHMEM" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-f8aa49970622dc56.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart TB
+  A[各 rank 创建 Python Buffer] --&gt; B[配置 NVSHMEM 环境并交换 unique ID]
+  B --&gt; C[C++ 选择 PE rank 与 world size]
+  C --&gt; D[NVSHMEM init / heap 注册 / QP 与 key 表]
+  D --&gt; E[CUDA warp 生成 WQE]
+  E --&gt; F{use_async_postsend}
+  F --&gt;|false| G[GPU ready_head]
+  G --&gt; H[GPU post_send / DBR / doorbell]
+  F --&gt;|true| I[GPU 发布 tx_wq.prod_idx]
+  I --&gt; J[NVSHMEM CPU helper 辅助提交]
+  H --&gt; K[NIC 执行 RDMA]
+  J --&gt; K
+  K --&gt; L[CQ 完成与应用 count / flag]</code></pre></details></figure><p>DeepEP 仓库没有完整 NVSHMEM transport 的 host helper 实现；它提供 GPU helper、NVSHMEM 初始化封装和使用方法。要继续研究 CPU helper 的实际 poll/batch 策略，应下载与目标安装版本一致的 NVSHMEM 源码。不要把 DeepEP 中没出现的 CPU 函数名想象成项目实现。</p>
+<h2 id="4-核心代码分支由状态决定"><a class="heading-link" href="#4-核心代码分支由状态决定">4. 核心代码：分支由状态决定</a></h2>
+<p>来自 <a href="source-4ac4b10b9bd1d873.html#L142"><code>ibgda_submit_requests</code></a>，省略函数签名与局部指针初始化：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-type">uint64_t</span> new_wqe_idx = base_wqe_idx + num_wqes;
+__threadfence();
+<span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> <span class="hljs-type">long</span> <span class="hljs-type">int</span>* ready_idx =
+    (<span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> <span class="hljs-type">long</span> <span class="hljs-type">int</span>*)(state-&gt;use_async_postsend
+        ? qp-&gt;tx_wq.prod_idx : &amp;mvars-&gt;tx_wq.ready_head);
+<span class="hljs-keyword">while</span> (<span class="hljs-built_in">atomicCAS</span>(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
+    ;
+<span class="hljs-keyword">if</span> (!state-&gt;use_async_postsend) {
+    <span class="hljs-keyword">constexpr</span> <span class="hljs-type">int</span> kNumRequestInBatch = <span class="hljs-number">4</span>;
+    <span class="hljs-keyword">if</span> (kAlwaysDoPostSend <span class="hljs-built_in">or</span> (message_idx + <span class="hljs-number">1</span>) % kNumRequestInBatch == <span class="hljs-number">0</span>)
+        <span class="hljs-built_in">ibgda_post_send</span>(qp, new_wqe_idx);
+}</code></pre></div>
+<p>逐段阅读：<code>new_wqe_idx</code> 是本次区间的末尾；<code>__threadfence</code> 排序 WQE 写入；CAS 等前驱区间填完。两种模式都需要形成无空洞前缀。区别在于更新哪个位置，以及 GPU 是否调用 <code>ibgda_post_send</code>。</p>
+<p><code>use_async_postsend=true</code> 时，GPU 仍已写好 WQE，后续由 NVSHMEM 的辅助机制处理 NIC 通知。<code>false</code> 时，GPU 在强制提交或消息编号达到批次边界时主动 post。数字 4 来自当前 helper 的批量策略，不是“每个模式固定一次只传 4 个 token”的算法约束。</p>
+<h3 id="41-gpu-直接提交为什么还需要锁"><a class="heading-link" href="#41-gpu-直接提交为什么还需要锁">4.1 GPU 直接提交为什么还需要锁</a></h3>
+<p><a href="source-4ac4b10b9bd1d873.html#L127"><code>ibgda_post_send</code></a> 中有：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-built_in">ibgda_lock_acquire</span>(&amp;mvars-&gt;post_send_lock);
+old_prod_idx = <span class="hljs-built_in">atomicMax</span>(
+    <span class="hljs-built_in">reinterpret_cast</span>&lt;<span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> <span class="hljs-type">long</span> <span class="hljs-type">int</span>*&gt;(&amp;mvars-&gt;tx_wq.prod_idx),
+    new_prod_idx);
+<span class="hljs-keyword">if</span> (new_prod_idx &gt; old_prod_idx) {
+    <span class="hljs-built_in">ibgda_update_dbr</span>(qp, new_prod_idx);
+    <span class="hljs-built_in">ibgda_ring_db</span>(qp, new_prod_idx);
+}
+<span class="hljs-built_in">ibgda_lock_release</span>(&amp;mvars-&gt;post_send_lock);</code></pre></div>
+<p>多个执行者共享 QP 时，先保护 doorbell 更新，再通过 <code>atomicMax</code> 防止提交位置倒退。CAS 发布解决“WQE 是否填完”，post-send lock 解决“谁更新 NIC 通知”；它们承担不同职责。若性能分析看到这里有竞争，应先检查 QP 映射与并发粒度，再决定是否增加 QP。</p>
+<h2 id="5-python-初始化环境变量不是孤立开关"><a class="heading-link" href="#5-python-初始化环境变量不是孤立开关">5. Python 初始化：环境变量不是孤立开关</a></h2>
+<p><a href="source-c6e5d87e7bd1b888.html#L105"><code>legacy.py:105</code></a> 的节选：</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">if</span> <span class="hljs-variable language_">self</span>.runtime.get_num_rdma_ranks() &gt; <span class="hljs-number">1</span> <span class="hljs-keyword">or</span> low_latency_mode:
+    <span class="hljs-keyword">assert</span> num_qps_per_rank &gt; <span class="hljs-number">0</span>
+    os.environ[<span class="hljs-string">&#x27;NVSHMEM_DISABLE_P2P&#x27;</span>] = <span class="hljs-string">&#x27;0&#x27;</span> <span class="hljs-keyword">if</span> allow_nvlink_for_low_latency_mode <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;1&#x27;</span>
+    os.environ[<span class="hljs-string">&#x27;NVSHMEM_IB_ENABLE_IBGDA&#x27;</span>] = <span class="hljs-string">&#x27;1&#x27;</span>
+    os.environ[<span class="hljs-string">&#x27;NVSHMEM_IBGDA_NUM_RC_PER_PE&#x27;</span>] = <span class="hljs-string">f&#x27;<span class="hljs-subst">{num_qps_per_rank}</span>&#x27;</span>
+    <span class="hljs-variable language_">self</span>.nvshmem_qp_depth = <span class="hljs-built_in">int</span>(os.environ.get(<span class="hljs-string">&#x27;NVSHMEM_QP_DEPTH&#x27;</span>, <span class="hljs-string">&#x27;1024&#x27;</span>))
+    os.environ[<span class="hljs-string">&#x27;NVSHMEM_QP_DEPTH&#x27;</span>] = <span class="hljs-built_in">str</span>(<span class="hljs-variable language_">self</span>.nvshmem_qp_depth)
+    <span class="hljs-comment"># ... 其他环境变量与 unique ID 交换 ...</span></code></pre></div>
+<p>这些赋值发生在 NVSHMEM 初始化之前。代码会覆盖其中一些环境变量，因此 shell 中的设置不一定就是最终值。当前项目没有在这里固定 <code>NVSHMEM_IBGDA_NIC_HANDLER</code>，具体 handler 模式需要结合所安装 NVSHMEM 的配置与运行日志确认。<a href="https://docs.nvidia.com/nvshmem/api/latest/gen/env.html" target="_blank" rel="noopener noreferrer">NVSHMEM 环境变量参考</a></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项目设置</th>
+<th>源码行为</th>
+<th>研究时要记录什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>NVSHMEM_IB_ENABLE_IBGDA=1</code></td>
+<td>请求启用 IBGDA</td>
+<td>transport 是否真正启用及其 handler</td>
+</tr>
+<tr>
+<td><code>NVSHMEM_IBGDA_NUM_RC_PER_PE</code></td>
+<td>由构造参数写入</td>
+<td>每 PE 连接资源与 local expert 数</td>
+</tr>
+<tr>
+<td><code>NVSHMEM_QP_DEPTH</code></td>
+<td>从环境读值，缺省 1024</td>
+<td>消息在途规模与 WQE 拆分</td>
+</tr>
+<tr>
+<td><code>NVSHMEM_DISABLE_P2P</code></td>
+<td>由允许 NVLink 的选项决定</td>
+<td>是否强制网络，避免错误对比</td>
+</tr>
+<tr>
+<td><code>NVSHMEM_CUMEM_GRANULARITY</code></td>
+<td>固定为 <code>2**29</code></td>
+<td>heap 分配/注册粒度及显存容量</td>
+</tr>
+<tr>
+<td><code>NVSHMEM_DISABLE_NVLS</code></td>
+<td>固定为 1</td>
+<td>此 legacy 初始化路径不用 NVLS</td>
+</tr>
+</tbody></table></div>
+<p>normal 的纯单节点构造且 <code>low_latency_mode=False</code> 不进入该分支；为兼容 LL 而启用此标志的单节点 Buffer 会初始化 NVSHMEM，但一次 normal intranode 调用的数据路径仍是 IPC/NVLink。</p>
+<h2 id="6-c-bootstrap-和-symmetric-heap"><a class="heading-link" href="#6-c-bootstrap-和-symmetric-heap">6. C++ bootstrap 和 symmetric heap</a></h2>
+<p><a href="source-1ad22e34baf9bc32.html#L46"><code>nvshmem::init</code></a> 的主干：</p>
+<div class="code-block"><div class="code-head"><span>CPP · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-cpp"><span class="hljs-type">nvshmemx_uniqueid_t</span> root_unique_id;
+<span class="hljs-type">nvshmemx_init_attr_t</span> attr;
+std::<span class="hljs-built_in">memcpy</span>(&amp;root_unique_id, root_unique_id_val.<span class="hljs-built_in">data</span>(), <span class="hljs-built_in">sizeof</span>(<span class="hljs-type">nvshmemx_uniqueid_t</span>));
+<span class="hljs-built_in">nvshmemx_set_attr_uniqueid_args</span>(rank, num_ranks, &amp;root_unique_id, &amp;attr);
+<span class="hljs-built_in">nvshmemx_init_attr</span>(NVSHMEMX_INIT_WITH_UNIQUEID, &amp;attr);</code></pre></div>
+<p>unique ID 让各进程加入同一通信组；它不携带每个 token 的路由。后面的 team split 与 barrier 用于建立通信域并等待就绪。分配封装 <a href="source-1ad22e34baf9bc32.html#L23"><code>nvshmem::alloc</code></a> 调用 <code>nvshmem_align(alignment, size)</code>。</p>
+<p><a href="source-18b1208d0de8c03b.html#L255"><code>Buffer::sync</code></a> 决定 normal 与 LL 的 PE 坐标，分配 RDMA buffer 并清零。调用者必须让组内进程按一致顺序执行初始化和相关 collective。一个 rank 因显存错误提前退出，其他 rank 卡在 barrier 只是后果，最早失败的 rank 才提供原因。</p>
+<h2 id="7-官方部署路线怎样阅读"><a class="heading-link" href="#7-官方部署路线怎样阅读">7. 官方部署路线怎样阅读</a></h2>
+<p>本地 <a href="reference-eb0690e6beed10e0.html">NVSHMEM 安装说明</a> 指明 legacy 使用 NVSHMEM 3.3.9 或更新兼容版本，并给出 traditional 驱动配置与 GDRCopy CPU-assisted 两条启用方式。版本数字属于这份源码基线的要求；部署时仍应核对目标 DeepEP 与 NVSHMEM 的配套版本。<a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/nvshmem.md" target="_blank" rel="noopener noreferrer">上游说明</a></p>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-3bd836fd721407de.svg" target="_blank"><img src="assets/diagram-3bd836fd721407de.svg" alt="流程图：CPU-assisted 与 NVSHMEM" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-3bd836fd721407de.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart TD
+  A[确定 DeepEP commit 和 NVSHMEM 版本] --&gt; B[核对 GPU / NIC / 网络拓扑]
+  B --&gt; C[安装兼容 NVSHMEM 与运行依赖]
+  C --&gt; D{部署采用何种 IBGDA 模式}
+  D --&gt; E[traditional: 核对 GPU 访问 NIC 控制资源的条件]
+  D --&gt; F[CPU-assisted: 核对 GDRCopy 与 gdrdrv]
+  E --&gt; G[记录运行日志和实际 transport]
+  F --&gt; G
+  G --&gt; H[先小规模正确性，再网络路径，再性能]</code></pre></details></figure><h3 id="71-traditional-路线"><a class="heading-link" href="#71-traditional-路线">7.1 traditional 路线</a></h3>
+<p>项目文档给出的 driver 选项为 <code>NVreg_EnableStreamMemOPs=1</code> 和 <code>PeerMappingOverride=1</code>，并要求相应系统配置生效。它们属于系统部署，不能在 Python 中通过普通环境变量等价替代。具体写入、initramfs 更新和重启步骤请按 <a href="reference-eb0690e6beed10e0.html#21-configure-nvidia-driver">原安装说明</a> 及集群维护流程操作。</p>
+<h3 id="72-cpu-assisted-路线"><a class="heading-link" href="#72-cpu-assisted-路线">7.2 CPU-assisted 路线</a></h3>
+<p>项目指向 GDRCopy 安装和 <code>gdrdrv</code> 加载。CPU 辅助的职责是通知 NIC，payload 依然由 NIC 传输。helper 的调度和 CPU 亲和性可能影响小消息延迟；这是待测因素，不应预先假定所有平台都会慢某个固定百分比。<a href="reference-eb0690e6beed10e0.html#22-install-gdrcopy-and-load-the-gdrdrv-kernel-module">项目对应章节</a></p>
+<h3 id="73-路径链接与运行库"><a class="heading-link" href="#73-路径链接与运行库">7.3 路径、链接与运行库</a></h3>
+<p>在 Linux shell 中，<code>NVSHMEM_DIR</code> 指向安装前缀，库和工具目录需要可发现。下面是模板，替换为实际安装目录：</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash"><span class="hljs-built_in">export</span> NVSHMEM_DIR=/opt/nvshmem
+<span class="hljs-built_in">export</span> LD_LIBRARY_PATH=<span class="hljs-string">&quot;<span class="hljs-variable">${NVSHMEM_DIR}</span>/lib:<span class="hljs-variable">${LD_LIBRARY_PATH}</span>&quot;</span>
+<span class="hljs-built_in">export</span> PATH=<span class="hljs-string">&quot;<span class="hljs-variable">${NVSHMEM_DIR}</span>/bin:<span class="hljs-variable">${PATH}</span>&quot;</span>
+nvshmem-info -a</code></pre></div>
+<p><code>nvshmem-info -a</code> 能帮助核对安装信息，但不能独立证明 DeepEP 正在使用哪条数据路径。还要检查 Python 加载的扩展、实际动态库、初始化日志、P2P 设置和真实跨节点测试。</p>
+<h2 id="8-分层检查每一步回答一个问题"><a class="heading-link" href="#8-分层检查每一步回答一个问题">8. 分层检查：每一步回答一个问题</a></h2>
+<p>下面命令用于已配置的 Linux GPU 节点；工具不存在时记录缺项，不把缺少工具误判成硬件故障。</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">nvidia-smi
+nvidia-smi topo -m
+ibv_devinfo
+nvshmem-info -a
+lsmod | grep -E <span class="hljs-string">&#x27;gdrdrv|nvidia_peermem&#x27;</span>
+python -c <span class="hljs-string">&quot;import torch, deep_ep; print(torch.__version__, torch.version.cuda); print(deep_ep.__file__)&quot;</span></code></pre></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>检查层</th>
+<th>看什么</th>
+<th>不足以证明什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GPU/驱动</td>
+<td>可见设备与驱动版本</td>
+<td>NIC 能注册和访问 GPU 内存</td>
+</tr>
+<tr>
+<td>GPU-NIC 拓扑</td>
+<td>PCIe/NUMA/NVLink 关系</td>
+<td>实际流量走哪条链路</td>
+</tr>
+<tr>
+<td>RDMA 设备</td>
+<td>端口、设备、链路状态</td>
+<td>应用正确选择 HCA 与 PE</td>
+</tr>
+<tr>
+<td>NVSHMEM 安装</td>
+<td>实际版本和配置</td>
+<td>kernel 的 put 已成功执行</td>
+</tr>
+<tr>
+<td>Python 扩展</td>
+<td>导入位置和 CUDA 版本</td>
+<td>编译/运行库完全兼容</td>
+</tr>
+<tr>
+<td>最小端到端测试</td>
+<td>真实 rank、数据校验与日志</td>
+<td>大规模稳定性与最佳性能</td>
+</tr>
+</tbody></table></div>
+<p>缺少 <code>nvidia_peermem</code> 不自动意味着所有 GPUDirect RDMA 都不可用：一些环境采用 DMA-BUF；必须结合实际注册方式判断。本节不提供通用的一键驱动修复命令。</p>
+<h2 id="9-怎样开始运行项目测试"><a class="heading-link" href="#9-怎样开始运行项目测试">9. 怎样开始运行项目测试</a></h2>
+<p>先读取 <a href="source-042f6d8fdf480b48.html#L318">LL 测试参数</a>、<a href="source-3dc29001eff5c239.html#L374">normal internode 参数</a> 和测试中的进程组初始化方法。以下是仓库根目录、单机八 GPU、已安装所有依赖的示例：</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">python tests/legacy/test_low_latency.py --num-processes 8 --num-tokens 128 --hidden 7168 --num-topk 8 --num-experts 288</code></pre></div>
+<p>同形状的 <code>--disable-nvlink</code> 可用于研究网络路径，但它会改变拓扑路径和负载，不能把变化全部归因于 IBGDA handler。跨节点运行需按项目测试采用的 launcher/环境变量组织各节点；不要只把 <code>--num-processes</code> 改成总 GPU 数就当成完整多节点启动命令。</p>
+<p>先记录正确性是否通过，再记录吞吐。测试里的 shrink/pressure 分支用于更深入的故障与重用研究，应在基础路径工作后阅读。没有真实 IB 集群时，可以完成源码追踪和地址练习，但不要生成虚构 benchmark 数字。</p>
+<h2 id="10-一个可复现的研究工作流"><a class="heading-link" href="#10-一个可复现的研究工作流">10. 一个可复现的研究工作流</a></h2>
+<p>问题示例：<strong>小 batch 的 p99 延迟是否受 CPU-assisted helper 调度影响？</strong> 这不是由源码直接给出的结论，而是可检验的假设。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>环节</th>
+<th>具体做法</th>
+<th>产物</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定版本</td>
+<td>commit、CUDA、NVSHMEM、驱动、NIC 固件、编译参数</td>
+<td>环境清单</td>
+</tr>
+<tr>
+<td>验证 treatment</td>
+<td>日志确认实际 handler，固定 P2P 设置</td>
+<td>两组配置证据</td>
+</tr>
+<tr>
+<td>控制变量</td>
+<td>相同 token/top-k/hidden、rank 数、路由分布</td>
+<td>实验矩阵</td>
+</tr>
+<tr>
+<td>测量</td>
+<td>warmup 后多次采样，分开 CUDA kernel 与完整迭代</td>
+<td>原始样本和计时定义</td>
+</tr>
+<tr>
+<td>分析</td>
+<td>p50/p95/p99、均值及离散度；检查 CPU 与 GPU 重叠</td>
+<td>图表及不确定性</td>
+</tr>
+<tr>
+<td>复核</td>
+<td>调换实验顺序、复跑不同日期或节点</td>
+<td>稳定性说明</td>
+</tr>
+</tbody></table></div>
+<p>若 traditional 模式在目标环境不可用，应报告无法完成该组实验。不能把“禁用 NVLink”或“减少 QP”替代成 traditional 与 CPU-assisted 的比较。</p>
+<h2 id="11-故障现象与源码落点"><a class="heading-link" href="#11-故障现象与源码落点">11. 故障现象与源码落点</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>优先检查</th>
+<th>项目代码证据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>初始化卡住</td>
+<td>最早失败 rank、组成员、unique ID、显存分配</td>
+<td><a href="source-1ad22e34baf9bc32.html#L46"><code>nvshmem.cu</code></a></td>
+</tr>
+<tr>
+<td>expert QP 断言</td>
+<td>local expert 数与 RC-per-PE</td>
+<td><a href="source-b40af34d5f05ac40.html#L285"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>count 永不到</td>
+<td>payload/通知分支、peer mapping、masked rank</td>
+<td><a href="source-b40af34d5f05ac40.html#L323"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>第一次正常，重复错误</td>
+<td>ping-pong 清理、recv hook 是否完成、buffer 复用</td>
+<td><a href="source-e55bfcc281ff0514.html#L102"><code>LowLatencyLayout</code></a></td>
+</tr>
+<tr>
+<td>错误数值但不超时</td>
+<td>地址 offset、dtype/scale、source token 反向索引</td>
+<td><a href="source-b40af34d5f05ac40.html#L978"><code>internode_ll.cu</code></a></td>
+</tr>
+<tr>
+<td>吞吐好但端到端慢</td>
+<td>常驻 SM、HBM 争用、CPU sync、缺少有效 overlap</td>
+<td><a href="implementation-v1-low-latency.html#1-与-v1-normalsm-方案的区别">两种 V1 实现对比</a></td>
+</tr>
+</tbody></table></div>
+<p>排障时先区分“初始化资源失败”“网络提交失败”“通知协议失败”“后处理语义错误”。调大 timeout 只能改变等待时长，不能修复丢失通知或 rank 分歧。</p>
+<h2 id="12-学习顺序与验收题"><a class="heading-link" href="#12-学习顺序与验收题">12. 学习顺序与验收题</a></h2>
+<p>第一轮只读第 1–4 节，能够指出 CPU-assisted 中 GPU 和 CPU 各自做什么。第二轮读第 5–8 节，从 Python 构造跟到 C++ bootstrap，写出最终环境与 PE 坐标。第三轮按照第 9–10 节设计实验，最后再阅读完整 LL kernel。</p>
+<p><strong>题 1：当前 DeepEP 是否强制 <code>NVSHMEM_IBGDA_NIC_HANDLER=gpu</code>？</strong> 没有；代码显式启用 IBGDA，但 handler 需运行证据确认。</p>
+<p><strong>题 2：GPU 发布 producer index 后就能覆盖源 payload 吗？</strong> 不能由这一个动作推出。发布请求与 NIC 消费源 buffer 是不同事件，需要完成机制和上层生命周期约束。</p>
+<p><strong>题 3：CPU-assisted 是否仍能存在 LL 的后台 RDMA 窗口？</strong> 从调度结构看可以：SEND 返回后等待 RECV 的间隔仍存在；实际 overlap 收益需考虑 helper 延迟与资源竞争。</p>
+<p><strong>题 4：为什么配置教程也必须读 CUDA？</strong> 环境决定 transport 是否可用，CUDA 分支决定这一次消息到底走 P2P 还是网络，以及用哪个 QP 发通知。</p>
+<h2 id="13-延伸阅读"><a class="heading-link" href="#13-延伸阅读">13. 延伸阅读</a></h2>
+<ul>
+<li><a href="tutorial-ibgda-principles.html">IBGDA 从消息到 NIC</a>：补全地址、WQE、CQ 的细节。</li>
+<li><a href="implementation-v1-sm.html">V1 SM 实现</a>：观察同一 IBGDA 如何服务 ring、credit 与 NVLink forwarding。</li>
+<li><a href="implementation-v1-low-latency.html">V1 LL 实现</a>：观察固定 buffer、负 count、hook、zero-copy 与 LogFMT。</li>
+<li><a href="tutorial-nccl-device-gin.html">NCCL Device API 与 GIN</a>：比较 V2 的 window/team/context 抽象。</li>
+</ul>
+<p>本篇原理证据来自 NVIDIA 文章，部署入口来自项目安装说明，代码解释来自本地固定源码。通过这种分工，可以在升级依赖后明确知道哪一部分需要重新验证。</p>
+</article><nav class="pager" aria-label="前后篇"><a href="tutorial-ibgda-principles.html">← GPUDirect Async 与 IBGDA</a><a href="implementation-v1-sm.html">V1 SM / normal 通信 →</a></nav><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#1-为什么还需要-cpu-assisted-模式">1. 为什么还需要 CPU-assisted 模式</a><a class="level-2" href="#2-三种实现的职责对照">2. 三种实现的职责对照</a><a class="level-2" href="#3-从初始化到每条消息的代码框图">3. 从初始化到每条消息的代码框图</a><a class="level-2" href="#4-核心代码分支由状态决定">4. 核心代码：分支由状态决定</a><a class="level-3" href="#41-gpu-直接提交为什么还需要锁">4.1 GPU 直接提交为什么还需要锁</a><a class="level-2" href="#5-python-初始化环境变量不是孤立开关">5. Python 初始化：环境变量不是孤立开关</a><a class="level-2" href="#6-c-bootstrap-和-symmetric-heap">6. C++ bootstrap 和 symmetric heap</a><a class="level-2" href="#7-官方部署路线怎样阅读">7. 官方部署路线怎样阅读</a><a class="level-3" href="#71-traditional-路线">7.1 traditional 路线</a><a class="level-3" href="#72-cpu-assisted-路线">7.2 CPU-assisted 路线</a><a class="level-3" href="#73-路径链接与运行库">7.3 路径、链接与运行库</a><a class="level-2" href="#8-分层检查每一步回答一个问题">8. 分层检查：每一步回答一个问题</a><a class="level-2" href="#9-怎样开始运行项目测试">9. 怎样开始运行项目测试</a><a class="level-2" href="#10-一个可复现的研究工作流">10. 一个可复现的研究工作流</a><a class="level-2" href="#11-故障现象与源码落点">11. 故障现象与源码落点</a><a class="level-2" href="#12-学习顺序与验收题">12. 学习顺序与验收题</a><a class="level-2" href="#13-延伸阅读">13. 延伸阅读</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

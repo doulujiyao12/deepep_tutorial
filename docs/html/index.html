@@ -1,0 +1,181 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="DeepEP 通信研究学习中心"><title>DeepEP 通信研究学习中心 · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link active" href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link " href="tutorial-ibgda-principles.html" ><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link " href="tutorial-nvshmem-deployment.html" ><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link " href="tutorial-nccl-device-gin.html" ><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">DEEP EP / RESEARCH NOTES</div><h1>DeepEP 通信研究学习中心</h1><p>沿着概念、源码和实验阅读 GPU 通信。</p><div class="chips"><span class="chip">7 分钟参考阅读</span><span class="chip">7 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><div class="route"><span>理解网络</span><span>→ 验证环境</span><span>→ 追踪内核</span><span>→ 设计实验</span></div><div class="cards"><a class="card" href="tutorial-ibgda-principles.html"><span class="num">01 / 基础 · 请求与完成</span><h2>GPUDirect Async 与 IBGDA</h2><p>从 symmetric 地址到 WQE、doorbell 和 CQ，逐步解释 GPU 如何驱动网络。</p><small>16 分钟参考阅读 · 14 个主题章节 · 进入全文 →</small></a><a class="card" href="tutorial-nvshmem-deployment.html"><span class="num">02 / 基础 · 部署与实验</span><h2>CPU-assisted 与 NVSHMEM</h2><p>比较三种控制面，连接初始化、部署验证与可复现的研究方法。</p><small>16 分钟参考阅读 · 13 个主题章节 · 进入全文 →</small></a><a class="card" href="implementation-v1-sm.html"><span class="num">03 / 实现 · 吞吐与队列</span><h2>V1 SM / normal 通信</h2><p>理解两级拓扑、warp 分工、channel ring、credit 和部分规约。</p><small>95 分钟参考阅读 · 18 个主题章节 · 进入全文 →</small></a><a class="card" href="implementation-v1-low-latency.html"><span class="num">04 / 实现 · 固定槽与重叠</span><h2>V1 Low-Latency</h2><p>解析 SEND/RECV、负 count、ping-pong、zero-copy 和经典双 micro-batch 图。</p><small>85 分钟参考阅读 · 20 个主题章节 · 进入全文 →</small></a><a class="card" href="tutorial-nccl-device-gin.html"><span class="num">05 / 基础 · 窗口与拓扑</span><h2>NCCL Device API 与 GIN</h2><p>从 communicator、window、team、context 到 put、signal、flush 的语义边界。</p><small>17 分钟参考阅读 · 14 个主题章节 · 进入全文 →</small></a><a class="card" href="implementation-v2-elastic.html"><span class="num">06 / 实现 · 统一通信接口</span><h2>V2 Elastic</h2><p>串联 direct/hybrid、EPHandle、运行时 JIT、TMA 与通信后规约。</p><small>100 分钟参考阅读 · 39 个主题章节 · 进入全文 →</small></a></div><article class="article"><h1 id="deepep-通信研究学习目录"><a class="heading-link" href="#deepep-通信研究学习目录">DeepEP 通信研究学习目录</a></h1>
+<blockquote>
+<p>六篇专题 · 从 IBGDA 基础到 V1/V2 内核 · Markdown 与离线 HTML 双版本</p>
+</blockquote>
+<p>本套材料把“网络怎么工作”“如何配置和验证”“项目怎样实现”连接起来。三篇基础教程解释底层概念，三篇实现文档跟读 DeepEP。每篇都有原理、流程/代码框图、源码位置、代码解释和学习建议。</p>
+<p><strong>HTML 阅读入口：<a href="index.html">打开学习中心</a></strong>。可直接用浏览器打开；页面、全文搜索、流程图和源码浏览均使用本地文件。官方外部资料仍需联网访问。</p>
+<h2 id="1-六篇文档与建议顺序"><a class="heading-link" href="#1-六篇文档与建议顺序">1. 六篇文档与建议顺序</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>文档</th>
+<th>阅读后应能回答</th>
+<th>HTML</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>01</td>
+<td><a href="tutorial-ibgda-principles.html">GPUDirect Async 与 IBGDA 原理</a></td>
+<td>谁构造 WQE？地址怎么翻译？何时才算完成？</td>
+<td><a href="tutorial-ibgda-principles.html">阅读</a></td>
+</tr>
+<tr>
+<td>02</td>
+<td><a href="tutorial-nvshmem-deployment.html">CPU-assisted IBGDA 与 NVSHMEM 部署</a></td>
+<td>三种控制面有何区别？如何核对实际路径和做实验？</td>
+<td><a href="tutorial-nvshmem-deployment.html">阅读</a></td>
+</tr>
+<tr>
+<td>03</td>
+<td><a href="implementation-v1-sm.html">V1 SM / normal 实现</a></td>
+<td>channel、warp、ring、credit 和两级通信如何协作？</td>
+<td><a href="implementation-v1-sm.html">阅读</a></td>
+</tr>
+<tr>
+<td>04</td>
+<td><a href="implementation-v1-low-latency.html">V1 Low-Latency 实现</a></td>
+<td>固定槽、count/flag、hook 和后台 RDMA 窗口如何实现？</td>
+<td><a href="implementation-v1-low-latency.html">阅读</a></td>
+</tr>
+<tr>
+<td>05</td>
+<td><a href="tutorial-nccl-device-gin.html">NCCL Device API 与 GIN</a></td>
+<td>window/team/context 和完成语义如何映射到 V2？</td>
+<td><a href="tutorial-nccl-device-gin.html">阅读</a></td>
+</tr>
+<tr>
+<td>06</td>
+<td><a href="implementation-v2-elastic.html">V2 Elastic 实现</a></td>
+<td>direct/hybrid、JIT、TMA、EPHandle、epilogue 如何组织？</td>
+<td><a href="implementation-v2-elastic.html">阅读</a></td>
+</tr>
+</tbody></table></div>
+<h2 id="2-按目标选择路线"><a class="heading-link" href="#2-按目标选择路线">2. 按目标选择路线</a></h2>
+<figure class="diagram"><a class="diagram-image" href="assets/diagram-0f03d6daef0555c8.svg" target="_blank"><img src="assets/diagram-0f03d6daef0555c8.svg" alt="流程图：DeepEP 通信研究学习中心" loading="lazy"></a><figcaption><span>结构与执行关系</span><a href="assets/diagram-0f03d6daef0555c8.svg" target="_blank">打开大图 ↗</a></figcaption><details><summary>查看 Mermaid 图源码</summary><pre><code>flowchart LR
+  A[01 IBGDA 原理] --&gt; B[02 CPU-assisted 与部署]
+  B --&gt; C[03 V1 SM]
+  B --&gt; D[04 V1 Low-Latency]
+  A --&gt; E[05 NCCL Device API / GIN]
+  E --&gt; F[06 V2 Elastic]
+  C -. 比较常驻通信 .-&gt; F
+  D -. 比较低延迟调度 .-&gt; F</code></pre></details></figure><p>**第一次接触 GPU 通信：**01 → 02 → 03 → 04 → 05 → 06。先理解消息、地址和完成，再读大内核的 warp 分工。</p>
+<p>**主要研究推理解码：**01 → 02 → 04 → 06。重点跟踪 SEND/RECV hook、固定上界、返回 handle 和真实有效 token 数；比较端到端延迟。</p>
+<p>**主要研究训练吞吐：**01 → 03 → 05 → 06。重点看 rank 去重、分层发送、队列 credit、SM/QP 数，以及通信和 GEMM 的资源竞争。</p>
+<p>**排查运行环境：**先读 02 的分层检查，再回到 01 确定控制面；若运行 V2，查 05 的 NCCL capability、版本和 window。</p>
+<h2 id="3-知识地图"><a class="heading-link" href="#3-知识地图">3. 知识地图</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>主文档</th>
+<th>源码定位</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>WQE、DBR、doorbell、CQ</td>
+<td>01、02</td>
+<td><a href="source-4ac4b10b9bd1d873.html">ibgda_device.cuh</a></td>
+</tr>
+<tr>
+<td>PE 与初始化配置</td>
+<td>02、03、04</td>
+<td><a href="source-c6e5d87e7bd1b888.html#L105">legacy.py</a>、<a href="source-1ad22e34baf9bc32.html">nvshmem.cu</a></td>
+</tr>
+<tr>
+<td>channel/SM/warp 分工</td>
+<td>03</td>
+<td><a href="source-aae9334d79f3470a.html#L452">internode.cu</a></td>
+</tr>
+<tr>
+<td>固定槽、负 count、P2P</td>
+<td>04、01</td>
+<td><a href="source-b40af34d5f05ac40.html#L253">internode_ll.cu</a></td>
+</tr>
+<tr>
+<td>经典双 micro-batch 图</td>
+<td>03、04</td>
+<td><a href="assets/5fdf495926f6a233.png">low-latency.png</a></td>
+</tr>
+<tr>
+<td>window/team/context</td>
+<td>05</td>
+<td><a href="source-3a37eef0e0422a3d.html">nccl.cu</a>、<a href="source-9012571458d2480d.html">handle.cuh</a></td>
+</tr>
+<tr>
+<td>GIN flush/signal/barrier</td>
+<td>05、06</td>
+<td><a href="source-67dca3271af53040.html#L129">comm.cuh</a></td>
+</tr>
+<tr>
+<td>JIT、direct/hybrid、epilogue</td>
+<td>06</td>
+<td><a href="source-38a14486389e16c7.html">compiler.hpp</a>、<a href="source-59b9fe79ae592e57.html">dispatch.cuh</a></td>
+</tr>
+<tr>
+<td>测量与实验</td>
+<td>02、各实现的研究章节</td>
+<td><a href="source-9fdbdde9e051f8e6.html">testing.py</a>、<a href="source-a9bdbc95bc560e6e.html">test_ep.py</a></td>
+</tr>
+</tbody></table></div>
+<h2 id="4-每篇都按同一个研究方法学习"><a class="heading-link" href="#4-每篇都按同一个研究方法学习">4. 每篇都按同一个研究方法学习</a></h2>
+<ol>
+<li><strong>提问题。</strong> 例如“为什么 LL 不需要先由 CPU 得到接收数？”</li>
+<li><strong>写解释。</strong> 固定上界与 GPU count 能够分离容量和真实 token 数。</li>
+<li><strong>定位代码。</strong> 在布局、SEND 通知、RECV pack、API 输出中各找一个证据。</li>
+<li><strong>画依赖。</strong> 标记 producer、消费者、数据写入、通知、等待和复用。</li>
+<li><strong>设计反例。</strong> 0 token、同 rank 的多个 expert、极不均衡路由、跨 slot 重用。</li>
+<li><strong>做实验。</strong> 固定版本、形状和拓扑，先正确性后性能，保存原始结果。</li>
+</ol>
+<p>学完的标志是能解释“哪行代码保证了什么，以及还没有保证什么”。</p>
+<h2 id="5-统一术语速查"><a class="heading-link" href="#5-统一术语速查">5. 统一术语速查</a></h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>术语</th>
+<th>读法与边界</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>dispatch</td>
+<td>token 发往 expert 所在位置，并建立反向映射</td>
+</tr>
+<tr>
+<td>combine</td>
+<td>expert 结果回源与规约；权重语义按 API 区分</td>
+</tr>
+<tr>
+<td>SM / block</td>
+<td>SM 是硬件，block 是调度单元；blockIdx.x 不是物理 SM id</td>
+</tr>
+<tr>
+<td>rank / PE / team peer</td>
+<td>编号需确认所属通信域</td>
+</tr>
+<tr>
+<td>IBGDA</td>
+<td>GPU 生成网络 work request，存在 traditional 与 CPU-assisted 模式</td>
+</tr>
+<tr>
+<td>GIN</td>
+<td>NCCL 设备端网络接口，具体 backend 与版本另行确认</td>
+</tr>
+<tr>
+<td>capacity / count</td>
+<td>buffer 容量与有效 token 数，不能互换</td>
+</tr>
+<tr>
+<td>source reuse / remote visibility</td>
+<td>源槽可重用与远端可读是两个事件</td>
+</tr>
+</tbody></table></div>
+<h2 id="6-版本与证据"><a class="heading-link" href="#6-版本与证据">6. 版本与证据</a></h2>
+<p>三篇实现文档保留 2026-08-26 的研究基线；三篇基础教程在 2026-09-23 对照同一本地源码与官方资料撰写。实际上游源码 commit 为 <code>01dc3aaac82068020353dce2c302e38153c0bfaa</code>，本地教程提交与上游源码提交不同。</p>
+<p>源码事实以代码为准；官方资料解释 API/硬件背景；性能模型与实验设计属于推导。当前 Windows 文档构建环境没有运行 GPU 集群验证。HTML 源码页是构建时快照，更新代码后应重新构建。</p>
+<p>外部入口：<a href="https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/" target="_blank" rel="noopener noreferrer">IBGDA 原理</a>、<a href="https://developer.nvidia.com/blog/?p=88550" target="_blank" rel="noopener noreferrer">CPU-assisted</a>、<a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/nvshmem.md" target="_blank" rel="noopener noreferrer">DeepEP NVSHMEM</a>、<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html" target="_blank" rel="noopener noreferrer">NCCL Device API</a>。</p>
+<h2 id="7-html-阅读与重建"><a class="heading-link" href="#7-html-阅读与重建">7. HTML 阅读与重建</a></h2>
+<p>HTML 包含目录与六篇完整正文，并提供必要的源码/补充材料页。左侧选篇目，右侧跳章节；全文搜索定位章节，代码可复制，流程图可打开大图，字体和明暗主题可切换，浏览器打印可保存 PDF。</p>
+<p>修改 Markdown 后在仓库根目录运行：</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">node docs/tools/build-docs.cjs</code></pre></div>
+<p>工具支持 <code>DEEPEP_DOCS_NODE_MODULES</code> 指定依赖目录；安装及验证方式见 <a href="reference-83e60823467312a8.html">构建说明</a>。阅读已生成 HTML 无需 Node。分享时复制整个 <code>docs/html/</code>，入口是 <code>index.html</code>。</p>
+</article><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#1-六篇文档与建议顺序">1. 六篇文档与建议顺序</a><a class="level-2" href="#2-按目标选择路线">2. 按目标选择路线</a><a class="level-2" href="#3-知识地图">3. 知识地图</a><a class="level-2" href="#4-每篇都按同一个研究方法学习">4. 每篇都按同一个研究方法学习</a><a class="level-2" href="#5-统一术语速查">5. 统一术语速查</a><a class="level-2" href="#6-版本与证据">6. 版本与证据</a><a class="level-2" href="#7-html-阅读与重建">7. HTML 阅读与重建</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

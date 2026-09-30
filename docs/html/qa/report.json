@@ -1,0 +1,182 @@
+{
+  "date": "2026-09-23",
+  "checks": [
+    {
+      "name": "local links checked",
+      "detail": 22366
+    },
+    {
+      "name": "full source hash",
+      "detail": "tutorial-ibgda-principles"
+    },
+    {
+      "name": "full source hash",
+      "detail": "tutorial-nvshmem-deployment"
+    },
+    {
+      "name": "full source hash",
+      "detail": "implementation-v1-sm"
+    },
+    {
+      "name": "full source hash",
+      "detail": "implementation-v1-low-latency"
+    },
+    {
+      "name": "full source hash",
+      "detail": "tutorial-nccl-device-gin"
+    },
+    {
+      "name": "full source hash",
+      "detail": "implementation-v2-elastic"
+    },
+    {
+      "name": "diagram generation",
+      "detail": "43 static SVGs"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "index.html",
+        "title": "DeepEP 通信研究学习中心 · DeepEP 研究手册",
+        "article": 2627,
+        "overflow": false,
+        "images": [],
+        "toc": 7,
+        "blocks": 1
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "index.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "tutorial-ibgda-principles.html",
+        "title": "GPUDirect Async 与 IBGDA · DeepEP 研究手册",
+        "article": 7783,
+        "overflow": false,
+        "images": [],
+        "toc": 14,
+        "blocks": 7
+      }
+    },
+    {
+      "name": "copy button feedback",
+      "detail": "代码已复制"
+    },
+    {
+      "name": "mobile width",
+      "detail": "tutorial-ibgda-principles.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "tutorial-nvshmem-deployment.html",
+        "title": "CPU-assisted 与 NVSHMEM · DeepEP 研究手册",
+        "article": 8217,
+        "overflow": false,
+        "images": [],
+        "toc": 17,
+        "blocks": 7
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "tutorial-nvshmem-deployment.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "implementation-v1-sm.html",
+        "title": "V1 SM / normal 通信 · DeepEP 研究手册",
+        "article": 54978,
+        "overflow": false,
+        "images": [],
+        "toc": 64,
+        "blocks": 66
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "implementation-v1-sm.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "implementation-v1-low-latency.html",
+        "title": "V1 Low-Latency · DeepEP 研究手册",
+        "article": 48283,
+        "overflow": false,
+        "images": [],
+        "toc": 68,
+        "blocks": 45
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "implementation-v1-low-latency.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "tutorial-nccl-device-gin.html",
+        "title": "NCCL Device API 与 GIN · DeepEP 研究手册",
+        "article": 8473,
+        "overflow": false,
+        "images": [],
+        "toc": 15,
+        "blocks": 5
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "tutorial-nccl-device-gin.html"
+    },
+    {
+      "name": "desktop render",
+      "detail": {
+        "f": "implementation-v2-elastic.html",
+        "title": "V2 Elastic · DeepEP 研究手册",
+        "article": 56832,
+        "overflow": false,
+        "images": [],
+        "toc": 115,
+        "blocks": 54
+      }
+    },
+    {
+      "name": "mobile width",
+      "detail": "implementation-v2-elastic.html"
+    },
+    {
+      "name": "full-text search",
+      "detail": "找到 31 个章节，显示前 31 个。"
+    },
+    {
+      "name": "empty search",
+      "detail": "no results"
+    },
+    {
+      "name": "theme",
+      "detail": "dark"
+    },
+    {
+      "name": "font resize",
+      "detail": "17px -> 18px"
+    },
+    {
+      "name": "mobile menu",
+      "detail": "visible"
+    }
+  ],
+  "errors": [],
+  "screenshots": [
+    "qa/index-desktop.png",
+    "qa/ibgda-diagram.png",
+    "qa/low-latency-desktop.png",
+    "qa/v2-mobile.png",
+    "qa/search-desktop.png",
+    "qa/index-dark.png"
+  ]
+}

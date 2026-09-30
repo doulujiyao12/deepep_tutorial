@@ -1,0 +1,451 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="DeepEP"><title>DeepEP · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link " href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link " href="tutorial-ibgda-principles.html" ><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link " href="tutorial-nvshmem-deployment.html" ><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link " href="tutorial-nccl-device-gin.html" ><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">DEEP EP / RESEARCH NOTES</div><h1>DeepEP</h1><p>沿着概念、源码和实验阅读 GPU 通信。</p><div class="chips"><span class="chip">30 分钟参考阅读</span><span class="chip">10 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><article class="article"><h1 id="deepep"><a class="heading-link" href="#deepep">DeepEP</a></h1>
+<p>DeepEP (DeepEveryParallel) is a high-performance communication library for modern machine learning training and inference. The library currently focuses on expert parallelism (EP) — providing high-throughput and low-latency all-to-all GPU kernels (MoE dispatch and combine) with low-precision support including FP8 — while also offering experimental primitives for pipeline parallelism (PP), context parallelism (CP), and remote memory access (Engram), all designed for zero or minimal SM occupation. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.</p>
+<p>Despite its lightweight design, DeepEP&#39;s performance matches or exceeds hardware bandwidth limits across various configurations.</p>
+<h2 id="news"><a class="heading-link" href="#news">News</a></h2>
+<ul>
+<li><strong>V2 release</strong>: A complete refactoring of Expert Parallelism — achieving extreme performance with several times fewer SM resources compared to V1, while supporting significantly larger scale-up and scale-out domains. V2 has also switched from the NVSHMEM backend to the more lightweight <strong>NCCL Gin backend</strong>.</li>
+</ul>
+<h3 id="new-features"><a class="heading-link" href="#new-features">New features</a></h3>
+<ul>
+<li><strong>Fully JIT</strong> (Just-In-Time compilation)</li>
+<li><strong>NCCL Gin backend</strong><ul>
+<li>Header-only &amp; lightweight</li>
+<li>Able to reuse existing NCCL communicators</li>
+</ul>
+</li>
+<li><strong>EPv2</strong><ul>
+<li>High-throughput and low-latency APIs unified into a single <code>ElasticBuffer</code> interface, with a new GEMM layout</li>
+<li>Larger scale-up &amp; scale-out domain support (up to EP2048)</li>
+<li>Analytical SM &amp; QP count calculation — no more auto-tuning needed</li>
+<li>Both hybrid &amp; direct modes remain supported</li>
+<li>For V3-like legacy training, SM usage reduced from 24 to 4 - 6 while maintaining equivalent or better performance</li>
+</ul>
+</li>
+<li><strong>0 SM Engram</strong> (with RDMA)</li>
+<li><strong>0 SM PP</strong> (with RDMA)</li>
+<li><strong>0 SM CP</strong> (with Copy Engine)</li>
+</ul>
+<h3 id="notes"><a class="heading-link" href="#notes">Notes</a></h3>
+<ul>
+<li>Buffer size consumption is larger than V1</li>
+<li>0 SM RDMA low-latency EP is no longer supported</li>
+<li>Engram, PP, and CP are experimental features</li>
+</ul>
+<h3 id="still-on-going-features"><a class="heading-link" href="#still-on-going-features">Still on-going features</a></h3>
+<ul>
+<li><strong>Elastic GPU &amp; CPU buffers</strong>: A contiguous virtual address space that maps to a hybrid of GPU and CPU physical memory under the hood, enabling fully automatic and transparent Engram or imbalanced EP</li>
+<li>Reducing intermediate buffer sizes by leveraging EP replay to handle load imbalance</li>
+<li>All-gather updates and reduce-scatter implementations for DP &amp; TP</li>
+</ul>
+<p>For the legacy V1 documentation (NVSHMEM-based), see <a href="reference-dc19dd11d8ad22fb.html">docs/legacy.md</a>.</p>
+<h2 id="performance"><a class="heading-link" href="#performance">Performance</a></h2>
+<p>Following V3&#39;s configuration, we tested with 8K tokens per batch, 7168 hidden dimensions, top 8 experts, FP8 dispatching, and BF16 combining, and obtained the following results:</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Arch</th>
+<th>NIC type</th>
+<th>Topo</th>
+<th>Dispatch Bottleneck Bandwidth</th>
+<th>Combine Bottleneck Bandwidth</th>
+<th>#SMs</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SM90</td>
+<td>CX7</td>
+<td>EP 8 x 2</td>
+<td>90 GB/s (RDMA)</td>
+<td>81 GB/s (RDMA)</td>
+<td>12</td>
+</tr>
+<tr>
+<td>SM90</td>
+<td>CX7</td>
+<td>EP 8 x 4</td>
+<td>61 GB/s (RDMA)</td>
+<td>61 GB/s (RDMA)</td>
+<td>6</td>
+</tr>
+<tr>
+<td>SM100</td>
+<td>CX7</td>
+<td>EP 8 x 2</td>
+<td>90 GB/s (RDMA)</td>
+<td>91 GB/s (RDMA)</td>
+<td>12</td>
+</tr>
+<tr>
+<td>SM100</td>
+<td>N/A</td>
+<td>EP 8</td>
+<td>726 GB/s (NVLink)</td>
+<td>740 GB/s (NVLink)</td>
+<td>64 (Max perf)</td>
+</tr>
+<tr>
+<td>SM100</td>
+<td>N/A</td>
+<td>EP 8</td>
+<td>643 GB/s (NVLink)</td>
+<td>675 GB/s (NVLink)</td>
+<td>24 (Min #SM)</td>
+</tr>
+</tbody></table></div>
+<p>Notes: the results are logical bandwidth. For example, under the <code>EP 8 x 2</code> case, 90 GB/s actually contains local rank traffic.</p>
+<p>Comparing with V1, <strong>V2 achieves up to 1.3x peak performance, while saving up to 4x SM count</strong>.</p>
+<p>We omit results for larger EP configurations for the time being, but encourage interested users to benchmark them directly. Based on our internal experience, we expect the kernel to continue saturating hardware bandwidth at scale.</p>
+<p>For V1 performance data, see <a href="reference-dc19dd11d8ad22fb.html#performance">docs/legacy.md</a>.</p>
+<h2 id="quick-start"><a class="heading-link" href="#quick-start">Quick start</a></h2>
+<h3 id="requirements"><a class="heading-link" href="#requirements">Requirements</a></h3>
+<ul>
+<li>Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support</li>
+<li>Python 3.8 and above</li>
+<li>CUDA version<ul>
+<li>CUDA 12.3 and above for SM90 GPUs</li>
+</ul>
+</li>
+<li>PyTorch 2.10 and above</li>
+<li>NCCL 2.30.4 and above</li>
+<li>NVLink for intranode communication</li>
+<li>RDMA network for internode communication</li>
+</ul>
+<h3 id="install-nccl-dependency"><a class="heading-link" href="#install-nccl-dependency">Install NCCL dependency</a></h3>
+<p>We recommend using pip to install NCCL so that DeepEP can automatically locate it within the Python environment. You can install it using the following command:</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">pip install <span class="hljs-string">&quot;nvidia-nccl-cu13&gt;=2.30.4&quot;</span> --no-deps</code></pre></div>
+<h3 id="install-nvshmem-dependency"><a class="heading-link" href="#install-nvshmem-dependency">Install NVSHMEM dependency</a></h3>
+<p>DeepEP also depends on NVSHMEM to provide support for legacy methods. Please refer to our <a href="reference-eb0690e6beed10e0.html">NVSHMEM Installation Guide</a> for instructions.</p>
+<h3 id="development"><a class="heading-link" href="#development">Development</a></h3>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash"><span class="hljs-comment"># Build and make symbolic links for SO files</span>
+python setup.py build
+<span class="hljs-comment"># You may modify the specific SO names according to your own platform</span>
+<span class="hljs-built_in">ln</span> -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
+
+<span class="hljs-comment"># Run test cases</span>
+<span class="hljs-comment"># NOTES: you may modify the `init_dist` function in `tests/utils/envs.py`</span>
+<span class="hljs-comment"># according to your own cluster settings, and launch into multiple nodes</span>
+python tests/elastic/test_ep.py
+python tests/elastic/test_agrs.py
+python tests/elastic/test_engram.py
+python tests/elastic/test_pp.py</code></pre></div>
+<h3 id="installation"><a class="heading-link" href="#installation">Installation</a></h3>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">python setup.py install</code></pre></div>
+<p>Then, import <code>deep_ep</code> in your Python project, and enjoy!</p>
+<h2 id="interfaces-and-examples"><a class="heading-link" href="#interfaces-and-examples">Interfaces and examples</a></h2>
+<h3 id="buffer-initialization"><a class="heading-link" href="#buffer-initialization">Buffer initialization</a></h3>
+<p>In V2, all EP operations — high-throughput and low-latency — are unified under a single <code>ElasticBuffer</code> interface. The buffer can be initialized by specifying MoE settings directly, and the optimal SM and QP counts are calculated analytically.</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">import</span> torch
+<span class="hljs-keyword">import</span> torch.distributed <span class="hljs-keyword">as</span> dist
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Optional</span>
+
+<span class="hljs-keyword">from</span> deep_ep <span class="hljs-keyword">import</span> ElasticBuffer
+
+<span class="hljs-comment"># Communication buffer (will allocate at runtime)</span>
+_buffer: <span class="hljs-type">Optional</span>[ElasticBuffer] = <span class="hljs-literal">None</span>
+
+<span class="hljs-comment"># Number of SMs to use for communication kernels (will be set at buffer creation)</span>
+_num_comm_sms: <span class="hljs-built_in">int</span> = <span class="hljs-number">0</span>
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_buffer</span>(<span class="hljs-params">group: dist.ProcessGroup,
+               num_max_tokens_per_rank: <span class="hljs-built_in">int</span>,
+               hidden: <span class="hljs-built_in">int</span>,
+               num_topk: <span class="hljs-built_in">int</span>,
+               num_experts: <span class="hljs-built_in">int</span>,
+               use_fp8_dispatch: <span class="hljs-built_in">bool</span> = <span class="hljs-literal">False</span></span>) -&gt; ElasticBuffer:
+    <span class="hljs-string">&quot;&quot;&quot;Initialize or retrieve the ElasticBuffer for EP communication.&quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    <span class="hljs-comment"># Check if we can reuse the existing buffer</span>
+    required_bytes = ElasticBuffer.get_buffer_size_hint(
+        group, num_max_tokens_per_rank, hidden,
+        num_topk=num_topk, use_fp8_dispatch=use_fp8_dispatch,
+    )
+    <span class="hljs-keyword">if</span> _buffer <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-literal">None</span> <span class="hljs-keyword">and</span> _buffer.group == group <span class="hljs-keyword">and</span> _buffer.num_bytes &gt;= required_bytes:
+        <span class="hljs-keyword">return</span> _buffer
+
+    <span class="hljs-comment"># Allocate a new buffer with MoE settings</span>
+    <span class="hljs-comment"># NOTES: V2 buffer size consumption is larger than V1</span>
+    _buffer = ElasticBuffer(
+        group,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        hidden=hidden,
+        num_topk=num_topk,
+        use_fp8_dispatch=use_fp8_dispatch,
+    )
+
+    <span class="hljs-comment"># V2 analytically calculates the optimal SM count — no more auto-tuning needed</span>
+    <span class="hljs-comment"># You may also specify `num_sms` manually in dispatch/combine calls to override</span>
+    _num_comm_sms = _buffer.get_theoretical_num_sms(num_experts, num_topk)
+
+    <span class="hljs-keyword">return</span> _buffer</code></pre></div>
+<h3 id="example-use-in-model-training-or-inference-prefilling"><a class="heading-link" href="#example-use-in-model-training-or-inference-prefilling">Example use in model training or inference prefilling</a></h3>
+<p>V2 unifies the dispatch and combine APIs into a single <code>ElasticBuffer</code> interface. The example below shows how to use them for training (with backward passes) or inference prefilling.</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">import</span> torch
+<span class="hljs-keyword">import</span> torch.distributed <span class="hljs-keyword">as</span> dist
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Tuple</span>, <span class="hljs-type">Union</span>
+
+<span class="hljs-keyword">from</span> deep_ep <span class="hljs-keyword">import</span> ElasticBuffer, EPHandle, EventOverlap
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">dispatch_forward</span>(<span class="hljs-params">x: <span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+                     topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                     num_experts: <span class="hljs-built_in">int</span>,
+                     num_max_tokens_per_rank: <span class="hljs-built_in">int</span>,
+                     expert_alignment: <span class="hljs-built_in">int</span> = <span class="hljs-number">1</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[<span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+              torch.Tensor, torch.Tensor, EPHandle, EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;
+    MoE dispatch: route tokens to the corresponding experts across all ranks.
+    Supports both BF16 and FP8 (x as a tuple of [data, scale_factors]) inputs.
+    &quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    recv_x, recv_topk_idx, recv_topk_weights, handle, event = _buffer.dispatch(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        expert_alignment=expert_alignment,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-comment"># `handle` contains routing metadata for the subsequent combine call</span>
+    <span class="hljs-comment"># `handle.num_recv_tokens_per_expert_list` provides per-expert token counts for GEMM</span>
+    <span class="hljs-comment"># Use `event.current_stream_wait()` to synchronize the compute stream before using results</span>
+    <span class="hljs-keyword">return</span> recv_x, recv_topk_idx, recv_topk_weights, handle, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">dispatch_backward</span>(<span class="hljs-params">grad_recv_x: torch.Tensor,
+                      grad_recv_topk_weights: torch.Tensor,
+                      handle: EPHandle</span>) -&gt; <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor, EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;The backward pass of MoE dispatch is actually a combine.&quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    combined_grad_x, combined_grad_topk_weights, event = _buffer.combine(
+        grad_recv_x,
+        handle=handle,
+        topk_weights=grad_recv_topk_weights,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-keyword">return</span> combined_grad_x, combined_grad_topk_weights, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">combine_forward</span>(<span class="hljs-params">x: torch.Tensor,
+                    handle: EPHandle</span>) -&gt; <span class="hljs-type">Tuple</span>[torch.Tensor, EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;MoE combine: reduce expert outputs back to their original ranks.&quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    combined_x, _, event = _buffer.combine(
+        x,
+        handle=handle,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-keyword">return</span> combined_x, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">combine_backward</span>(<span class="hljs-params">grad_combined_x: <span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+                     handle: EPHandle</span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[<span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]], EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;The backward pass of MoE combine is actually a dispatch.&quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    grad_x, _, _, _, event = _buffer.dispatch(
+        grad_combined_x,
+        handle=handle,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-keyword">return</span> grad_x, event</code></pre></div>
+<p>For communication-computation overlap, use the <code>EventOverlap</code> interface to manage dependencies between the communication stream and the compute stream:</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-comment"># After dispatch, overlap computation while communication is in-flight</span>
+recv_x, recv_topk_idx, recv_topk_weights, handle, event = dispatch_forward(...)
+
+<span class="hljs-comment"># ... do some independent computation here ...</span>
+
+<span class="hljs-comment"># Wait for communication to finish before using results</span>
+event.current_stream_wait()
+
+<span class="hljs-comment"># Now safe to use recv_x, recv_topk_idx, recv_topk_weights</span></code></pre></div>
+<h3 id="example-use-in-inference-decoding"><a class="heading-link" href="#example-use-in-inference-decoding">Example use in inference decoding</a></h3>
+<p>For inference decoding, the same <code>ElasticBuffer</code> is used. The handle-caching pattern allows reusing routing metadata across iterations when the gating decisions remain unchanged, avoiding redundant CPU synchronization.</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">import</span> torch
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Tuple</span>, <span class="hljs-type">Optional</span>, <span class="hljs-type">Union</span>
+
+<span class="hljs-keyword">from</span> deep_ep <span class="hljs-keyword">import</span> ElasticBuffer, EPHandle, EventOverlap
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">decode_dispatch</span>(<span class="hljs-params">x: <span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+                    topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                    num_experts: <span class="hljs-built_in">int</span>,
+                    num_max_tokens_per_rank: <span class="hljs-built_in">int</span>,
+                    cached_handle: <span class="hljs-type">Optional</span>[EPHandle] = <span class="hljs-literal">None</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[<span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+              torch.Tensor, torch.Tensor, EPHandle, EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;
+    MoE dispatch for inference decoding.
+    If `cached_handle` is provided, the layout is reused without CPU synchronization.
+    &quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    <span class="hljs-keyword">if</span> cached_handle <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-literal">None</span>:
+        <span class="hljs-comment"># Reuse cached handle: skip layout recomputation and CPU sync</span>
+        recv_x, _, _, handle, event = _buffer.dispatch(
+            x,
+            handle=cached_handle,
+            num_sms=_num_comm_sms,
+            async_with_compute_stream=<span class="hljs-literal">True</span>,
+        )
+        <span class="hljs-keyword">return</span> recv_x, cached_handle.topk_idx, <span class="hljs-literal">None</span>, handle, event
+
+    recv_x, recv_topk_idx, recv_topk_weights, handle, event = _buffer.dispatch(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-keyword">return</span> recv_x, recv_topk_idx, recv_topk_weights, handle, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">decode_combine</span>(<span class="hljs-params">x: torch.Tensor,
+                   handle: EPHandle</span>) -&gt; <span class="hljs-type">Tuple</span>[torch.Tensor, EventOverlap]:
+    <span class="hljs-string">&quot;&quot;&quot;MoE combine for inference decoding.&quot;&quot;&quot;</span>
+    <span class="hljs-keyword">global</span> _buffer, _num_comm_sms
+
+    combined_x, _, event = _buffer.combine(
+        x,
+        handle=handle,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=<span class="hljs-literal">True</span>,
+    )
+
+    <span class="hljs-keyword">return</span> combined_x, event</code></pre></div>
+<h3 id="environment-variables"><a class="heading-link" href="#environment-variables">Environment variables</a></h3>
+<p>The library provides some environment variables, which may be useful:</p>
+<ul>
+<li>General<ul>
+<li><code>EP_BUFFER_DEBUG</code>: <code>0</code> or <code>1</code>, print buffer initialization, SM approximation, and backend debugging information, <code>0</code> by default</li>
+<li><code>EP_SUPPRESS_NCCL_CHECK</code>: <code>0</code> or <code>1</code>, suppress NCCL version mismatch checking, <code>0</code> by default</li>
+<li><code>EP_AVOID_RECORD_STREAM</code>: <code>0</code> or <code>1</code>, avoid <code>record_stream</code> on output tensors, <code>0</code> by default</li>
+<li><code>EP_NUM_TOPK_IDX_BITS</code>: integer, override the number of bits for top-k index encoding, <code>0</code> (auto) by default</li>
+</ul>
+</li>
+<li>Networking<ul>
+<li><code>EP_NIC_NAME</code>: string, the default NIC name used to query NIC properties, <code>mlx5_0</code> by default</li>
+<li><code>EP_OVERRIDE_RDMA_SL</code>: integer, override the RDMA service level index for traffic isolation</li>
+<li><code>EP_DISABLE_GIN</code>: <code>0</code> or <code>1</code>, disable the NCCL Gin backend (fall back to non-Gin path), <code>0</code> by default</li>
+</ul>
+</li>
+<li>JIT<ul>
+<li><code>EP_JIT_DEBUG</code>: <code>0</code> or <code>1</code>, print JIT debugging information, <code>0</code> by default</li>
+<li><code>EP_JIT_CACHE_DIR</code>: string, cache directory for compiled kernels, <code>$HOME/.deep_ep</code> by default</li>
+<li><code>EP_JIT_NVCC_COMPILER</code>: string, NVCC compiler path; defaults to <code>torch.utils.cpp_extension.CUDA_HOME</code></li>
+<li><code>EP_JIT_CPP_STANDARD</code>: integer, C++ standard version, <code>20</code> by default</li>
+<li><code>EP_JIT_PRINT_COMPILER_COMMAND</code>: <code>0</code> or <code>1</code>, print compilation commands, <code>0</code> by default</li>
+<li><code>EP_JIT_PTXAS_VERBOSE</code>: <code>0</code> or <code>1</code>, show detailed PTXAS output, <code>0</code> by default</li>
+<li><code>EP_JIT_PTXAS_CHECK</code>: <code>0</code> or <code>1</code>, assert no local memory usage in compiled kernels, <code>0</code> by default</li>
+<li><code>EP_JIT_WITH_LINEINFO</code>: <code>0</code> or <code>1</code>, embed source line info for profiling tools, <code>0</code> by default</li>
+<li><code>EP_JIT_DUMP_ASM</code>: <code>0</code> or <code>1</code>, dump both PTX and SASS, <code>0</code> by default</li>
+<li><code>EP_JIT_DUMP_PTX</code>: <code>0</code> or <code>1</code>, dump PTX output, <code>0</code> by default</li>
+<li><code>EP_JIT_DUMP_SASS</code>: <code>0</code> or <code>1</code>, dump SASS output, <code>0</code> by default</li>
+</ul>
+</li>
+<li>Debug and profiling<ul>
+<li><code>EP_GIN_GDAKI_DEBUG</code>: <code>0</code> or <code>1</code>, enable NCCL Gin GDAKI debugging output, <code>0</code> by default</li>
+<li><code>EP_USE_NVIDIA_TOOLS</code>: <code>0</code> or <code>1</code>, skip internal profiling when running under external NVIDIA tools, <code>0</code> by default</li>
+<li><code>EP_DISABLE_BARRIER_PROFILING</code>: <code>0</code> or <code>1</code>, disable barrier-based communication profiling in benchmarks, <code>0</code> by default</li>
+</ul>
+</li>
+<li>Build<ul>
+<li><code>EP_NCCL_ROOT_DIR</code>: string, path to the NCCL installation directory; auto-detected from the Python environment if not set</li>
+<li><code>EP_NVSHMEM_ROOT_DIR</code>: string, path to the NVSHMEM installation directory; auto-detected from the Python environment if not set</li>
+<li><code>TORCH_CUDA_ARCH_LIST</code>: string, list of target CUDA architectures, e.g. <code>&quot;9.0&quot;</code></li>
+<li><code>DISABLE_SM90_FEATURES</code>: <code>0</code> or <code>1</code>, disable SM90 features for legacy methods, <code>0</code> by default</li>
+<li><code>DISABLE_AGGRESSIVE_PTX_INSTRS</code>: <code>0</code> or <code>1</code>, disable aggressive load/store instructions in legacy methods, <code>0</code> by default</li>
+</ul>
+</li>
+</ul>
+<p>Some environment variables are <strong>persistent</strong>: they are captured at build time and baked into the installed package as default values. At import time, these defaults are applied automatically unless overridden by current environment variables. The persistent variables are: <code>EP_JIT_CACHE_DIR</code>, <code>EP_JIT_PRINT_COMPILER_COMMAND</code>, <code>EP_NUM_TOPK_IDX_BITS</code>, <code>EP_NCCL_ROOT_DIR</code>.</p>
+<p>For additional details, please refer to <a href="source-a9bdbc95bc560e6e.html">the test code</a> or review the corresponding Python documentation.</p>
+<h2 id="network-configurations"><a class="heading-link" href="#network-configurations">Network configurations</a></h2>
+<p>DeepEP is fully tested with InfiniBand networks. However, it is theoretically compatible with RDMA over Converged Ethernet (RoCE) as well.</p>
+<h3 id="traffic-isolation"><a class="heading-link" href="#traffic-isolation">Traffic isolation</a></h3>
+<p>Traffic isolation is supported by InfiniBand through Virtual Lanes (VL).</p>
+<p>To prevent interference between different types of traffic, we recommend segregating workloads across different virtual lanes as follows:</p>
+<ul>
+<li>expert-parallel workloads</li>
+<li>other workloads</li>
+</ul>
+<p>For DeepEP V2, you can control the virtual lane assignment by setting the <code>sl_idx</code> argument or the <code>EP_OVERRIDE_RDMA_SL</code> environment variable.</p>
+<h3 id="adaptive-routing"><a class="heading-link" href="#adaptive-routing">Adaptive routing</a></h3>
+<p>Adaptive routing is an advanced routing feature provided by InfiniBand switches that can evenly distribute traffic across multiple paths. Even though adaptive routing introduces additional latency, we still recommend enabling it under all network load conditions.</p>
+<h3 id="congestion-control"><a class="heading-link" href="#congestion-control">Congestion control</a></h3>
+<p>Congestion control is disabled because it hurts maximum bandwidth. If congestion is unavoidable in some scenarios, we recommend assigning those workloads to low-priority virtual lanes.</p>
+<h3 id="pci-atomic-mode"><a class="heading-link" href="#pci-atomic-mode">PCI atomic mode</a></h3>
+<p>If the hardware supports it, we recommend using the following command to set the NIC&#39;s <code>PCI_ATOMIC_MODE</code> to improve RDMA atomic operation performance:</p>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash"><span class="hljs-built_in">sudo</span> mlxconfig -y -d mlx5_<span class="hljs-variable">$i</span> <span class="hljs-built_in">set</span> PCI_ATOMIC_MODE=4</code></pre></div>
+<h2 id="experimental-branches"><a class="heading-link" href="#experimental-branches">Experimental branches</a></h2>
+<ul>
+<li><a href="https://github.com/deepseek-ai/DeepEP/pull/453" target="_blank" rel="noopener noreferrer">Zero-copy</a><ul>
+<li>Removing the copy between PyTorch tensors and communication buffers, which reduces the SM usages significantly for normal kernels</li>
+<li>This PR is authored by <strong>Tencent Network Platform Department</strong></li>
+</ul>
+</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/pull/437" target="_blank" rel="noopener noreferrer">Eager</a><ul>
+<li>Using a low-latency protocol removes the extra RTT latency introduced by RDMA atomic OPs</li>
+</ul>
+</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep" target="_blank" rel="noopener noreferrer">Hybrid-EP</a><ul>
+<li>A new backend implementation using TMA instructions for minimal SM usage and larger NVLink domain support</li>
+<li>Fine-grained communication-computation overlap for single-batch scenarios</li>
+<li>PCIe kernel support for non-NVLink environments</li>
+<li>NVFP4 data type support</li>
+</ul>
+</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/tree/antgroup-opt" target="_blank" rel="noopener noreferrer">AntGroup-Opt</a><ul>
+<li>This optimization series is authored by <strong>AntGroup Network Platform Department</strong></li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/pull/347" target="_blank" rel="noopener noreferrer">Normal-SMFree</a> Eliminating SM from RDMA path by decoupling comm-kernel execution from NIC token transfer, freeing SMs for compute</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/pull/483" target="_blank" rel="noopener noreferrer">LL-SBO</a> Overlapping Down GEMM computation with Combine Send communication via signaling mechanism to reduce end-to-end latency</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/pull/500" target="_blank" rel="noopener noreferrer">LL-Layered</a> Optimizing cross-node LL operator communication using rail-optimized forwarding and data merging to reduce latency</li>
+</ul>
+</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/tree/mori-ep" target="_blank" rel="noopener noreferrer">Mori-EP</a><ul>
+<li>ROCm/AMD GPU support powered by <a href="https://github.com/ROCm/mori" target="_blank" rel="noopener noreferrer">MORI</a> backend (low-latency mode)</li>
+</ul>
+</li>
+<li><a href="https://github.com/deepseek-ai/DeepEP/tree/nvDev" target="_blank" rel="noopener noreferrer">nvDev</a><ul>
+<li>V2-based branch with the latest CUDA features, such as Compute Fabric Transport (CFT) that brings better latency on small token sizes.</li>
+</ul>
+</li>
+</ul>
+<h2 id="community-forks"><a class="heading-link" href="#community-forks">Community forks</a></h2>
+<ul>
+<li><a href="https://github.com/uccl-project/uccl/tree/main/ep" target="_blank" rel="noopener noreferrer">uccl/uccl-ep</a> - Enables running DeepEP on heterogeneous GPUs (e.g., Nvidia, AMD) and NICs (e.g., EFA, Broadcom, CX7)</li>
+<li><a href="https://github.com/Infrawaves/DeepEP_ibrc_dual-ports_multiQP" target="_blank" rel="noopener noreferrer">Infrawaves/DeepEP_ibrc_dual-ports_multiQP</a> - Adds multi-QP solution and dual-port NIC support in IBRC transport</li>
+<li><a href="https://github.com/antgroup/DeepXTrace" target="_blank" rel="noopener noreferrer">antgroup/DeepXTrace</a> - A diagnostic analyzer for efficient and precise localization of slow ranks</li>
+<li><a href="https://github.com/ROCm/mori" target="_blank" rel="noopener noreferrer">ROCm/mori</a> - AMD&#39;s next-generation communication library for performance-critical AI workloads (e.g., Wide EP, KVCache transfer, Collectives)</li>
+</ul>
+<h2 id="acknowledgement"><a class="heading-link" href="#acknowledgement">Acknowledgement</a></h2>
+<p>DeepEP V2 is built on top of the <a href="https://github.com/nvidia/nccl" target="_blank" rel="noopener noreferrer">NCCL</a> Gin backend. Thanks to @sjeaugey, @pakmarkthub, @sb17v, @xiaofanl-nvidia, and the NCCL team for their support!</p>
+<h2 id="license"><a class="heading-link" href="#license">License</a></h2>
+<p>This code repository is released under <a href="source-c693279643b8cd5d.html">the MIT License</a>.</p>
+<h2 id="citation"><a class="heading-link" href="#citation">Citation</a></h2>
+<div class="code-block"><div class="code-head"><span>BIBTEX · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bibtex">@misc{deepep2025,
+      title={DeepEP: an efficient expert-parallel communication library},
+      author={Chenggang Zhao and Shangyan Zhou and Liyue Zhang and Chengqi Deng and Zhean Xu and Yuxuan Liu and Kuai Yu and Jiashi Li and Liang Zhao},
+      year={2025},
+      publisher = {GitHub},
+      howpublished = {\url{https://github.com/deepseek-ai/DeepEP}},
+}</code></pre></div>
+</article><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#news">News</a><a class="level-3" href="#new-features">New features</a><a class="level-3" href="#notes">Notes</a><a class="level-3" href="#still-on-going-features">Still on-going features</a><a class="level-2" href="#performance">Performance</a><a class="level-2" href="#quick-start">Quick start</a><a class="level-3" href="#requirements">Requirements</a><a class="level-3" href="#install-nccl-dependency">Install NCCL dependency</a><a class="level-3" href="#install-nvshmem-dependency">Install NVSHMEM dependency</a><a class="level-3" href="#development">Development</a><a class="level-3" href="#installation">Installation</a><a class="level-2" href="#interfaces-and-examples">Interfaces and examples</a><a class="level-3" href="#buffer-initialization">Buffer initialization</a><a class="level-3" href="#example-use-in-model-training-or-inference-prefilling">Example use in model training or inference prefilling</a><a class="level-3" href="#example-use-in-inference-decoding">Example use in inference decoding</a><a class="level-3" href="#environment-variables">Environment variables</a><a class="level-2" href="#network-configurations">Network configurations</a><a class="level-3" href="#traffic-isolation">Traffic isolation</a><a class="level-3" href="#adaptive-routing">Adaptive routing</a><a class="level-3" href="#congestion-control">Congestion control</a><a class="level-3" href="#pci-atomic-mode">PCI atomic mode</a><a class="level-2" href="#experimental-branches">Experimental branches</a><a class="level-2" href="#community-forks">Community forks</a><a class="level-2" href="#acknowledgement">Acknowledgement</a><a class="level-2" href="#license">License</a><a class="level-2" href="#citation">Citation</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

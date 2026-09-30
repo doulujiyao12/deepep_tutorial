@@ -1,0 +1,360 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="DeepEP V1 (Legacy)"><title>DeepEP V1 (Legacy) · DeepEP 研究手册</title><link rel="stylesheet" href="assets/reader.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head><body><header class="topbar"><button id="menu" class="menu-toggle" aria-label="打开篇目导航" aria-expanded="false">☰</button><a class="brand" href="index.html"><strong>DeepEP</strong> / 研究手册<small>COMMUNICATION LAB</small></a><button id="open-search" class="search-launch">搜索六篇全文 <kbd>Ctrl K</kbd></button><div class="toolbar"><button class="font-btn" data-step="-1" aria-label="缩小字体">A−</button><button class="font-btn" data-step="1" aria-label="放大字体">A+</button><button id="theme" aria-label="切换明暗主题">◐</button><button id="print" class="print-btn">打印</button></div></header><div class="progress" aria-hidden="true"></div><div class="layout"><nav class="sidebar" aria-label="六篇教程"><div class="eyebrow">学习路径 / READING PATH</div><a class="nav-link " href="index.html"><span class="num">⌂</span><span>阅读总目录<small>六篇教程 · 学习路线</small></span></a><a class="nav-link " href="tutorial-ibgda-principles.html" ><span class="num">01</span><span>GPUDirect Async 与 IBGDA<small>基础 · 请求与完成</small></span></a><a class="nav-link " href="tutorial-nvshmem-deployment.html" ><span class="num">02</span><span>CPU-assisted 与 NVSHMEM<small>基础 · 部署与实验</small></span></a><a class="nav-link " href="implementation-v1-sm.html" ><span class="num">03</span><span>V1 SM / normal 通信<small>实现 · 吞吐与队列</small></span></a><a class="nav-link " href="implementation-v1-low-latency.html" ><span class="num">04</span><span>V1 Low-Latency<small>实现 · 固定槽与重叠</small></span></a><a class="nav-link " href="tutorial-nccl-device-gin.html" ><span class="num">05</span><span>NCCL Device API 与 GIN<small>基础 · 窗口与拓扑</small></span></a><a class="nav-link " href="implementation-v2-elastic.html" ><span class="num">06</span><span>V2 Elastic<small>实现 · 统一通信接口</small></span></a><div class="side-note">源码基线 <code>01dc3aaa</code><br>基础教程更新：2026.09.23<br>静态流程图 · 离线全文搜索<br><a href="reference-build.html">版本与构建信息</a></div></nav><main class="main"><section class="hero"><div class="eyebrow">DEEP EP / RESEARCH NOTES</div><h1>DeepEP V1 (Legacy)</h1><p>沿着概念、源码和实验阅读 GPU 通信。</p><div class="chips"><span class="chip">26 分钟参考阅读</span><span class="chip">6 个主题章节</span><span class="chip">源码基线 01dc3aaa</span><span class="chip">可离线阅读</span></div></section><article class="article"><h1 id="deepep-v1-legacy"><a class="heading-link" href="#deepep-v1-legacy">DeepEP V1 (Legacy)</a></h1>
+<blockquote>
+<p><strong>Note:</strong> This is the archived documentation for DeepEP V1 (NVSHMEM-based). For the latest V2 documentation, see the <a href="reference-b335630551682c19.html">main README</a>.</p>
+</blockquote>
+<hr>
+<p>DeepEP (DeepEveryParallel) V1 is the original high-performance communication library for modern machine learning, focused on expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.</p>
+<p>To align with the group-limited gating algorithm proposed in the <a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener noreferrer">DeepSeek-V3</a> paper, DeepEP V1 offers a set of kernels optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain. These kernels deliver high throughput, making them suitable for both training and inference prefilling tasks. Additionally, they support SM (Streaming Multiprocessors) number control.</p>
+<p>For latency-sensitive inference decoding, DeepEP V1 includes a set of low-latency kernels with pure RDMA to minimize delays. The library also introduces a hook-based communication-computation overlapping method that does not occupy any SM resource.</p>
+<p>Notice: the implementation in this library may have some slight differences from the <a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener noreferrer">DeepSeek-V3</a> paper.</p>
+<h2 id="performance"><a class="heading-link" href="#performance">Performance</a></h2>
+<h3 id="normal-kernels-with-nvlink-and-rdma-forwarding"><a class="heading-link" href="#normal-kernels-with-nvlink-and-rdma-forwarding">Normal kernels with NVLink and RDMA forwarding</a></h3>
+<p>We test normal kernels on H800 (~160 GB/s NVLink maximum bandwidth), with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow the DeepSeek-V3/R1 pretraining setting (4096 tokens per batch, 7168 hidden, top-4 groups, top-8 experts, FP8 dispatching and BF16 combining).</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th align="center">Type</th>
+<th align="center">Dispatch #EP</th>
+<th align="center">Bottleneck bandwidth</th>
+<th align="center">Combine #EP</th>
+<th align="center">Bottleneck bandwidth</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center">Intranode</td>
+<td align="center">8</td>
+<td align="center">153 GB/s (NVLink)</td>
+<td align="center">8</td>
+<td align="center">158 GB/s (NVLink)</td>
+</tr>
+<tr>
+<td align="center">Internode</td>
+<td align="center">16</td>
+<td align="center">43 GB/s (RDMA)</td>
+<td align="center">16</td>
+<td align="center">43 GB/s (RDMA)</td>
+</tr>
+<tr>
+<td align="center">Internode</td>
+<td align="center">32</td>
+<td align="center">58 GB/s (RDMA)</td>
+<td align="center">32</td>
+<td align="center">57 GB/s (RDMA)</td>
+</tr>
+<tr>
+<td align="center">Internode</td>
+<td align="center">64</td>
+<td align="center">51 GB/s (RDMA)</td>
+<td align="center">64</td>
+<td align="center">50 GB/s (RDMA)</td>
+</tr>
+</tbody></table></div>
+<h3 id="low-latency-kernels-with-pure-rdma"><a class="heading-link" href="#low-latency-kernels-with-pure-rdma">Low-latency kernels with pure RDMA</a></h3>
+<p>We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow a typical DeepSeek-V3/R1 production setting (128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining).</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th align="center">Dispatch #EP</th>
+<th align="center">Latency</th>
+<th align="center">RDMA bandwidth</th>
+<th align="center">Combine #EP</th>
+<th align="center">Latency</th>
+<th align="center">RDMA bandwidth</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center">8</td>
+<td align="center">77 us</td>
+<td align="center">98 GB/s</td>
+<td align="center">8</td>
+<td align="center">114 us</td>
+<td align="center">127 GB/s</td>
+</tr>
+<tr>
+<td align="center">16</td>
+<td align="center">118 us</td>
+<td align="center">63 GB/s</td>
+<td align="center">16</td>
+<td align="center">195 us</td>
+<td align="center">74 GB/s</td>
+</tr>
+<tr>
+<td align="center">32</td>
+<td align="center">155 us</td>
+<td align="center">48 GB/s</td>
+<td align="center">32</td>
+<td align="center">273 us</td>
+<td align="center">53 GB/s</td>
+</tr>
+<tr>
+<td align="center">64</td>
+<td align="center">173 us</td>
+<td align="center">43 GB/s</td>
+<td align="center">64</td>
+<td align="center">314 us</td>
+<td align="center">46 GB/s</td>
+</tr>
+<tr>
+<td align="center">128</td>
+<td align="center">192 us</td>
+<td align="center">39 GB/s</td>
+<td align="center">128</td>
+<td align="center">369 us</td>
+<td align="center">39 GB/s</td>
+</tr>
+<tr>
+<td align="center">256</td>
+<td align="center">194 us</td>
+<td align="center">39 GB/s</td>
+<td align="center">256</td>
+<td align="center">360 us</td>
+<td align="center">40 GB/s</td>
+</tr>
+</tbody></table></div>
+<h2 id="quick-start"><a class="heading-link" href="#quick-start">Quick Start</a></h2>
+<h3 id="requirements"><a class="heading-link" href="#requirements">Requirements</a></h3>
+<ul>
+<li>Ampere (SM80), Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support</li>
+<li>Python 3.8 and above</li>
+<li>CUDA version<ul>
+<li>CUDA 11.0 and above for SM80 GPUs</li>
+<li>CUDA 12.3 and above for SM90 GPUs</li>
+</ul>
+</li>
+<li>PyTorch 2.1 and above</li>
+<li>NVLink for intranode communication</li>
+<li>RDMA network for internode communication</li>
+</ul>
+<h3 id="download-and-install-nvshmem-dependency"><a class="heading-link" href="#download-and-install-nvshmem-dependency">Download and install NVSHMEM dependency</a></h3>
+<p>DeepEP V1 depends on NVSHMEM. Please refer to the NVSHMEM Installation Guide for instructions.</p>
+<h3 id="development"><a class="heading-link" href="#development">Development</a></h3>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash"><span class="hljs-comment"># Build and make symbolic links for SO files</span>
+NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
+<span class="hljs-comment"># You may modify the specific SO names according to your own platform</span>
+<span class="hljs-built_in">ln</span> -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
+
+<span class="hljs-comment"># Run test cases</span>
+<span class="hljs-comment"># NOTES: you may modify the `init_dist` function in `tests/utils.py`</span>
+<span class="hljs-comment"># according to your own cluster settings, and launch into multiple nodes</span>
+python tests/test_intranode.py
+python tests/test_internode.py
+python tests/test_low_latency.py</code></pre></div>
+<h3 id="installation"><a class="heading-link" href="#installation">Installation</a></h3>
+<div class="code-block"><div class="code-head"><span>BASH · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-bash">NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install</code></pre></div>
+<h4 id="installation-environment-variables"><a class="heading-link" href="#installation-environment-variables">Installation environment variables</a></h4>
+<ul>
+<li><code>NVSHMEM_DIR</code>: the path to the NVSHMEM directory, disable all internode and low-latency features if not specified</li>
+<li><code>DISABLE_SM90_FEATURES</code>: 0 or 1, whether to disable SM90 features, it is required for SM90 devices or CUDA 11</li>
+<li><code>TORCH_CUDA_ARCH_LIST</code>: the list of target architectures, e.g. <code>TORCH_CUDA_ARCH_LIST=&quot;9.0&quot;</code></li>
+<li><code>DISABLE_AGGRESSIVE_PTX_INSTRS</code>: 0 or 1, whether to disable aggressive load/store instructions, see <a href="#undefined-behavior-ptx-usage">Undefined-behavior PTX usage</a> for more details</li>
+</ul>
+<h2 id="network-configurations"><a class="heading-link" href="#network-configurations">Network Configurations</a></h2>
+<p>DeepEP is fully tested with InfiniBand networks. However, it is theoretically compatible with RDMA over Converged Ethernet (RoCE) as well.</p>
+<h3 id="traffic-isolation"><a class="heading-link" href="#traffic-isolation">Traffic isolation</a></h3>
+<p>Traffic isolation is supported by InfiniBand through Virtual Lanes (VL).</p>
+<p>To prevent interference between different types of traffic, we recommend segregating workloads across different virtual lanes as follows:</p>
+<ul>
+<li>workloads using normal kernels</li>
+<li>workloads using low-latency kernels</li>
+<li>other workloads</li>
+</ul>
+<p>For DeepEP V1, you can control the virtual lane assignment by setting the <code>NVSHMEM_IB_SL</code> environment variable.</p>
+<h3 id="adaptive-routing"><a class="heading-link" href="#adaptive-routing">Adaptive routing</a></h3>
+<p>Adaptive routing is an advanced routing feature provided by InfiniBand switches that can evenly distribute traffic across multiple paths. Enabling adaptive routing can completely eliminate network congestion caused by routing conflicts, but it also introduces additional latency. We recommend the following configuration for optimal performance:</p>
+<ul>
+<li>enable adaptive routing in environments with heavy network loads</li>
+<li>use static routing in environments with light network loads</li>
+</ul>
+<h3 id="congestion-control"><a class="heading-link" href="#congestion-control">Congestion control</a></h3>
+<p>Congestion control is disabled as we have not observed significant congestion in our production environment.</p>
+<h2 id="interfaces-and-examples"><a class="heading-link" href="#interfaces-and-examples">Interfaces and Examples</a></h2>
+<h3 id="example-use-in-model-training-or-inference-prefilling"><a class="heading-link" href="#example-use-in-model-training-or-inference-prefilling">Example use in model training or inference prefilling</a></h3>
+<p>The normal kernels can be used in model training or the inference prefilling phase (without the backward part) as the below example code shows.</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">import</span> torch
+<span class="hljs-keyword">import</span> torch.distributed <span class="hljs-keyword">as</span> dist
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">List</span>, <span class="hljs-type">Tuple</span>, <span class="hljs-type">Optional</span>, <span class="hljs-type">Union</span>
+
+<span class="hljs-keyword">from</span> deep_ep <span class="hljs-keyword">import</span> Buffer, EventOverlap
+
+<span class="hljs-comment"># Communication buffer (will allocate at runtime)</span>
+_buffer: <span class="hljs-type">Optional</span>[Buffer] = <span class="hljs-literal">None</span>
+
+<span class="hljs-comment"># Set the number of SMs to use</span>
+<span class="hljs-comment"># NOTES: this is a static variable</span>
+Buffer.set_num_sms(<span class="hljs-number">24</span>)
+
+
+<span class="hljs-comment"># You may call this function at the framework initialization</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_buffer</span>(<span class="hljs-params">group: dist.ProcessGroup, hidden_bytes: <span class="hljs-built_in">int</span></span>) -&gt; Buffer:
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests</span>
+    num_nvl_bytes, num_rdma_bytes = <span class="hljs-number">0</span>, <span class="hljs-number">0</span>
+    <span class="hljs-keyword">for</span> config <span class="hljs-keyword">in</span> (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
+        num_nvl_bytes = <span class="hljs-built_in">max</span>(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
+        num_rdma_bytes = <span class="hljs-built_in">max</span>(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+
+    <span class="hljs-comment"># Allocate a buffer if not existed or not enough buffer size</span>
+    <span class="hljs-keyword">if</span> _buffer <span class="hljs-keyword">is</span> <span class="hljs-literal">None</span> <span class="hljs-keyword">or</span> _buffer.group != group <span class="hljs-keyword">or</span> _buffer.num_nvl_bytes &lt; num_nvl_bytes <span class="hljs-keyword">or</span> _buffer.num_rdma_bytes &lt; num_rdma_bytes:
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+    <span class="hljs-keyword">return</span> _buffer
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_hidden_bytes</span>(<span class="hljs-params">x: torch.Tensor</span>) -&gt; <span class="hljs-built_in">int</span>:
+    t = x[<span class="hljs-number">0</span>] <span class="hljs-keyword">if</span> <span class="hljs-built_in">isinstance</span>(x, <span class="hljs-built_in">tuple</span>) <span class="hljs-keyword">else</span> x
+    <span class="hljs-keyword">return</span> t.size(<span class="hljs-number">1</span>) * <span class="hljs-built_in">max</span>(t.element_size(), <span class="hljs-number">2</span>)
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">dispatch_forward</span>(<span class="hljs-params">x: <span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+                     topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                     num_experts: <span class="hljs-built_in">int</span>, previous_event: <span class="hljs-type">Optional</span>[EventOverlap] = <span class="hljs-literal">None</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[<span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, <span class="hljs-type">List</span>, <span class="hljs-type">Tuple</span>, EventOverlap]:
+    <span class="hljs-comment"># NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency</span>
+    <span class="hljs-comment"># of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please</span>
+    <span class="hljs-comment"># refer to the docs of `Buffer.dispatch`</span>
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># Calculate layout before actual dispatch</span>
+    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, previous_event = \
+        _buffer.get_dispatch_layout(topk_idx, num_experts,
+                                    previous_event=previous_event, async_finish=<span class="hljs-literal">True</span>,
+                                    allocate_on_comm_stream=previous_event <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-literal">None</span>)
+    <span class="hljs-comment"># Do MoE dispatch</span>
+    <span class="hljs-comment"># NOTES: the CPU will wait for GPU&#x27;s signal to arrive, so this is not compatible with CUDA graph</span>
+    <span class="hljs-comment"># Unless you specify `num_worst_tokens`, but this flag is for intranode only</span>
+    <span class="hljs-comment"># For more advanced usages, please refer to the docs of the `dispatch` function</span>
+    recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
+        _buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
+                         num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                         is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                         previous_event=previous_event, async_finish=<span class="hljs-literal">True</span>,
+                         allocate_on_comm_stream=<span class="hljs-literal">True</span>)
+    <span class="hljs-comment"># For event management, please refer to the docs of the `EventOverlap` class</span>
+    <span class="hljs-keyword">return</span> recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">dispatch_backward</span>(<span class="hljs-params">grad_recv_x: torch.Tensor, grad_recv_topk_weights: torch.Tensor, handle: <span class="hljs-type">Tuple</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor, EventOverlap]:
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># The backward process of MoE dispatch is actually a combine</span>
+    <span class="hljs-comment"># For more advanced usages, please refer to the docs of the `combine` function</span>
+    combined_grad_x, combined_grad_recv_topk_weights, event = \
+        _buffer.combine(grad_recv_x, handle, topk_weights=grad_recv_topk_weights, async_finish=<span class="hljs-literal">True</span>)
+
+    <span class="hljs-comment"># For event management, please refer to the docs of the `EventOverlap` class</span>
+    <span class="hljs-keyword">return</span> combined_grad_x, combined_grad_recv_topk_weights, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">combine_forward</span>(<span class="hljs-params">x: torch.Tensor, handle: <span class="hljs-type">Tuple</span>, previous_event: <span class="hljs-type">Optional</span>[EventOverlap] = <span class="hljs-literal">None</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[torch.Tensor, EventOverlap]:
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># Do MoE combine</span>
+    <span class="hljs-comment"># For more advanced usages, please refer to the docs of the `combine` function</span>
+    combined_x, _, event = _buffer.combine(x, handle, async_finish=<span class="hljs-literal">True</span>, previous_event=previous_event,
+                                           allocate_on_comm_stream=previous_event <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-literal">None</span>)
+
+    <span class="hljs-comment"># For event management, please refer to the docs of the `EventOverlap` class</span>
+    <span class="hljs-keyword">return</span> combined_x, event
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">combine_backward</span>(<span class="hljs-params">grad_combined_x: <span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]],
+                     handle: <span class="hljs-type">Tuple</span>, previous_event: <span class="hljs-type">Optional</span>[EventOverlap] = <span class="hljs-literal">None</span></span>) -&gt; \
+        <span class="hljs-type">Tuple</span>[<span class="hljs-type">Union</span>[torch.Tensor, <span class="hljs-type">Tuple</span>[torch.Tensor, torch.Tensor]], EventOverlap]:
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># The backward process of MoE combine is actually a dispatch</span>
+    <span class="hljs-comment"># For more advanced usages, please refer to the docs of the `dispatch` function</span>
+    grad_x, _, _, _, _, event = _buffer.dispatch(grad_combined_x, handle=handle, async_finish=<span class="hljs-literal">True</span>,
+                                                 previous_event=previous_event,
+                                                 allocate_on_comm_stream=previous_event <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-literal">None</span>)
+
+    <span class="hljs-comment"># For event management, please refer to the docs of the `EventOverlap` class</span>
+    <span class="hljs-keyword">return</span> grad_x, event</code></pre></div>
+<p>Moreover, inside the dispatch function, we may not know how many tokens to receive for the current rank. So an implicit CPU wait for GPU received count signal will be involved, as the following figure shows.</p>
+<p><img loading="lazy" src="assets/48722d7ac0d46ec2.png" alt="normal"></p>
+<h3 id="example-use-in-inference-decoding"><a class="heading-link" href="#example-use-in-inference-decoding">Example use in inference decoding</a></h3>
+<p>The low latency kernels can be used in the inference decoding phase as the below example code shows.</p>
+<div class="code-block"><div class="code-head"><span>PYTHON · 源码摘录 / 教学示例</span><button class="copy" type="button">复制</button></div><pre><code class="language-python"><span class="hljs-keyword">import</span> torch
+<span class="hljs-keyword">import</span> torch.distributed <span class="hljs-keyword">as</span> dist
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Tuple</span>, <span class="hljs-type">Optional</span>
+
+<span class="hljs-keyword">from</span> deep_ep <span class="hljs-keyword">import</span> Buffer
+
+<span class="hljs-comment"># Communication buffer (will allocate at runtime)</span>
+<span class="hljs-comment"># NOTES: there is no SM control API for the low-latency kernels</span>
+_buffer: <span class="hljs-type">Optional</span>[Buffer] = <span class="hljs-literal">None</span>
+
+
+<span class="hljs-comment"># You may call this function at the framework initialization</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_buffer</span>(<span class="hljs-params">group: dist.ProcessGroup, num_max_dispatch_tokens_per_rank: <span class="hljs-built_in">int</span>, hidden: <span class="hljs-built_in">int</span>, num_experts: <span class="hljs-built_in">int</span></span>) -&gt; Buffer:
+    <span class="hljs-comment"># NOTES: the low-latency mode will consume much more space than the normal mode</span>
+    <span class="hljs-comment"># So we recommend that `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256</span>
+    <span class="hljs-keyword">global</span> _buffer
+    num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts)
+
+    <span class="hljs-comment"># Allocate a buffer if not existed or not enough buffer size</span>
+    <span class="hljs-keyword">if</span> _buffer <span class="hljs-keyword">is</span> <span class="hljs-literal">None</span> <span class="hljs-keyword">or</span> _buffer.group != group <span class="hljs-keyword">or</span> <span class="hljs-keyword">not</span> _buffer.low_latency_mode <span class="hljs-keyword">or</span> _buffer.num_rdma_bytes &lt; num_rdma_bytes:
+        <span class="hljs-comment"># NOTES: for the best performance, the QP number **must** be equal to the number of the local experts</span>
+        <span class="hljs-keyword">assert</span> num_experts % group.size() == <span class="hljs-number">0</span>
+        _buffer = Buffer(group, <span class="hljs-number">0</span>, num_rdma_bytes, low_latency_mode=<span class="hljs-literal">True</span>, num_qps_per_rank=num_experts // group.size())
+    <span class="hljs-keyword">return</span> _buffer
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">low_latency_dispatch</span>(<span class="hljs-params">hidden_states: torch.Tensor, topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: <span class="hljs-built_in">int</span>, num_experts: <span class="hljs-built_in">int</span></span>):
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)</span>
+    recv_hidden_states, recv_expert_count, handle, event, hook = \
+        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
+                                     async_finish=<span class="hljs-literal">False</span>, return_recv_hook=<span class="hljs-literal">True</span>)
+
+    <span class="hljs-comment"># NOTES: the actual tensor will not be received only if you call `hook()`,</span>
+    <span class="hljs-comment"># it is useful for double-batch overlapping, but **without any SM occupation**</span>
+    <span class="hljs-comment"># If you don&#x27;t want to overlap, please set `return_recv_hook=False`</span>
+    <span class="hljs-comment"># Later, you can use our GEMM library to do the computation with this specific format</span>
+    <span class="hljs-keyword">return</span> recv_hidden_states, recv_expert_count, handle, event, hook
+
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">low_latency_combine</span>(<span class="hljs-params">hidden_states: torch.Tensor,
+                        topk_idx: torch.Tensor, topk_weights: torch.Tensor, handle: <span class="hljs-type">Tuple</span></span>):
+    <span class="hljs-keyword">global</span> _buffer
+
+    <span class="hljs-comment"># Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)</span>
+    combined_hidden_states, event_overlap, hook = \
+        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle,
+                                    async_finish=<span class="hljs-literal">False</span>, return_recv_hook=<span class="hljs-literal">True</span>)
+
+    <span class="hljs-comment"># NOTES: the same behavior as described in the dispatch kernel</span>
+    <span class="hljs-keyword">return</span> combined_hidden_states, event_overlap, hook</code></pre></div>
+<p>For two-micro-batch overlapping, you can refer to the following figure. With our receiving hook interface, the RDMA network traffic is happening in the background, without costing any GPU SMs from the computation part. But notice, the overlapped parts can be adjusted, i.e., the 4 parts of attention/dispatch/MoE/combine may not have the exact same execution time. You may adjust the stage settings according to your workload.</p>
+<p><img loading="lazy" src="assets/5fdf495926f6a233.png" alt="low-latency"></p>
+<h2 id="roadmap-v1"><a class="heading-link" href="#roadmap-v1">Roadmap (V1)</a></h2>
+<ul>
+<li><input checked="" disabled="" type="checkbox"> AR support</li>
+<li><input checked="" disabled="" type="checkbox"> Refactor low-latency mode AR code</li>
+<li><input checked="" disabled="" type="checkbox"> A100 support (intranode only)</li>
+<li><input checked="" disabled="" type="checkbox"> Support BF16 for the low-latency dispatch kernel</li>
+<li><input checked="" disabled="" type="checkbox"> Support NVLink protocol for intranode low-latency kernels</li>
+<li><input disabled="" type="checkbox"> TMA copy instead of LD/ST<ul>
+<li><input checked="" disabled="" type="checkbox"> Intranode kernels</li>
+<li><input disabled="" type="checkbox"> Internode kernels</li>
+<li><input disabled="" type="checkbox"> Low-latency kernels</li>
+</ul>
+</li>
+<li><input disabled="" type="checkbox"> SM-free kernels and refactors</li>
+<li><input disabled="" type="checkbox"> Fully remove undefined-behavior PTX instructions</li>
+</ul>
+<h2 id="notices"><a class="heading-link" href="#notices">Notices</a></h2>
+<h4 id="easier-potential-overall-design"><a class="heading-link" href="#easier-potential-overall-design">Easier potential overall design</a></h4>
+<p>The V1 implementation uses queues for communication buffers which save memory but introduce complexity and potential deadlocks. If you&#39;re implementing your own version based on DeepEP V1, consider using fixed-size buffers allocated to maximum capacity for simplicity and better performance. For a detailed discussion of this alternative approach, see <a href="https://github.com/deepseek-ai/DeepEP/issues/39" target="_blank" rel="noopener noreferrer">https://github.com/deepseek-ai/DeepEP/issues/39</a>.</p>
+<h4 id="undefined-behavior-ptx-usage"><a class="heading-link" href="#undefined-behavior-ptx-usage">Undefined-behavior PTX usage</a></h4>
+<ul>
+<li>For extreme performance, we discover and use an undefined-behavior PTX usage: using read-only PTX <code>ld.global.nc.L1::no_allocate.L2::256B</code> to <strong>read volatile data</strong>. The PTX modifier <code>.nc</code> indicates that a non-coherent cache is used. But the correctness is tested to be guaranteed with <code>.L1::no_allocate</code> on Hopper architectures, and performance will be much better. The reason we guess may be: the non-coherent cache is unified with L1, and the L1 modifier is not just a hint but a strong option, so that the correctness can be guaranteed by no dirty data in L1.</li>
+<li>Initially, because NVCC could not automatically unroll volatile read PTX, we tried using <code>__ldg</code> (i.e., <code>ld.nc</code>). Even compared to manually unrolled volatile reads, it was significantly faster (likely due to additional compiler optimizations). However, the results could be incorrect or dirty. After consulting the PTX documentation, we discovered that L1 and non-coherent cache are unified on Hopper architectures. We speculated that <code>.L1::no_allocate</code> might resolve the issue, leading to this discovery.</li>
+<li>If you find kernels not working on some other platforms, you may add <code>DISABLE_AGGRESSIVE_PTX_INSTRS=1</code> to <code>setup.py</code> and disable this, or file an issue.</li>
+</ul>
+<h4 id="auto-tuning-on-your-cluster"><a class="heading-link" href="#auto-tuning-on-your-cluster">Auto-tuning on your cluster</a></h4>
+<p>For better performance on your cluster, we recommend to run all the tests and use the best auto-tuned configuration. The default configurations are optimized on the DeepSeek&#39;s internal cluster.</p>
+</article><footer class="footer">DeepEP 通信研究手册 · 原理以官方资料为背景，代码行为以固定源码为准。<br>文档和页面经过静态与浏览器检查；GPU 集群实验需另行运行。</footer></main><aside class="toc" aria-label="本页章节"><div class="eyebrow">本页目录 / ON THIS PAGE</div><a class="level-2" href="#performance">Performance</a><a class="level-3" href="#normal-kernels-with-nvlink-and-rdma-forwarding">Normal kernels with NVLink and RDMA forwarding</a><a class="level-3" href="#low-latency-kernels-with-pure-rdma">Low-latency kernels with pure RDMA</a><a class="level-2" href="#quick-start">Quick Start</a><a class="level-3" href="#requirements">Requirements</a><a class="level-3" href="#download-and-install-nvshmem-dependency">Download and install NVSHMEM dependency</a><a class="level-3" href="#development">Development</a><a class="level-3" href="#installation">Installation</a><a class="level-2" href="#network-configurations">Network Configurations</a><a class="level-3" href="#traffic-isolation">Traffic isolation</a><a class="level-3" href="#adaptive-routing">Adaptive routing</a><a class="level-3" href="#congestion-control">Congestion control</a><a class="level-2" href="#interfaces-and-examples">Interfaces and Examples</a><a class="level-3" href="#example-use-in-model-training-or-inference-prefilling">Example use in model training or inference prefilling</a><a class="level-3" href="#example-use-in-inference-decoding">Example use in inference decoding</a><a class="level-2" href="#roadmap-v1">Roadmap (V1)</a><a class="level-2" href="#notices">Notices</a></aside></div><dialog class="search-dialog" id="search" aria-label="搜索六篇教程"><form class="search-box" method="dialog"><input id="query" type="search" placeholder="例如：doorbell、低延迟、flush、get_sym_ptr" aria-label="全文搜索" autocomplete="off"><button id="close-search" type="button">关闭</button></form><div id="search-info" class="search-info" role="status"></div><div id="results" class="search-results"></div></dialog><button id="top" class="back-top" aria-label="回到页首">↑</button><noscript><div class="no-js">正文、目录和流程图仍可阅读；搜索、主题切换和复制需启用 JavaScript。</div></noscript><script src="assets/search-index.js"></script><script src="assets/reader.js"></script></body></html>

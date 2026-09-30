@@ -1,0 +1,59 @@
+{
+  "date": "2026-09-23",
+  "sourceBaseline": "01dc3aaac82068020353dce2c302e38153c0bfaa",
+  "documents": [
+    {
+      "id": "tutorial-ibgda-principles",
+      "title": "GPUDirect Async 与 IBGDA",
+      "source": "docs\\tutorial-ibgda-principles.md",
+      "url": "tutorial-ibgda-principles.html",
+      "hash": "45f0403e0dd188d6",
+      "characters": 10957
+    },
+    {
+      "id": "tutorial-nvshmem-deployment",
+      "title": "CPU-assisted 与 NVSHMEM",
+      "source": "docs\\tutorial-nvshmem-deployment.md",
+      "url": "tutorial-nvshmem-deployment.html",
+      "hash": "db1b389d1366ecbb",
+      "characters": 10722
+    },
+    {
+      "id": "implementation-v1-sm",
+      "title": "V1 SM / normal 通信",
+      "source": "docs\\implementation-v1-sm.md",
+      "url": "implementation-v1-sm.html",
+      "hash": "62ee83d2837b9cd6",
+      "characters": 66342
+    },
+    {
+      "id": "implementation-v1-low-latency",
+      "title": "V1 Low-Latency",
+      "source": "docs\\implementation-v1-low-latency.md",
+      "url": "implementation-v1-low-latency.html",
+      "hash": "ee0e3394e8e01188",
+      "characters": 59144
+    },
+    {
+      "id": "tutorial-nccl-device-gin",
+      "title": "NCCL Device API 与 GIN",
+      "source": "docs\\tutorial-nccl-device-gin.md",
+      "url": "tutorial-nccl-device-gin.html",
+      "hash": "869d84fb8892dbbe",
+      "characters": 11869
+    },
+    {
+      "id": "implementation-v2-elastic",
+      "title": "V2 Elastic",
+      "source": "docs\\implementation-v2-elastic.md",
+      "url": "implementation-v2-elastic.html",
+      "hash": "a173cde3c1be37c6",
+      "characters": 69718
+    }
+  ],
+  "pages": 14,
+  "sources": 45,
+  "diagrams": 43,
+  "searchSections": 344,
+  "warnings": []
+}

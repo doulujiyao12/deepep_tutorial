@@ -1,5 +1,7 @@
 # DeepEP V2 Elastic 实现详解
 
+[六篇学习目录](reading-guide.md) · [NCCL Device API 与 GIN 前置教程](tutorial-nccl-device-gin.md) · [HTML 阅读版](html/implementation-v2-elastic.html)
+
 > 本文对应仓库中的 V2 `ElasticBuffer` / elastic kernels。V2 是一次完整重构：EP 的训练吞吐与推理解码接口被统一，内核改为运行时 JIT 编译，通信后端从 NVSHMEM 切换到 NCCL Gin，并同时支持 direct 与 hybrid 两种拓扑。
 
 > **研究基线**：本地 tutorial/main 的教程文档提交为 `f99f06868616c6fa96f83ff1caa5f0231f9ee3bc`（2026-08-25）；它相对父提交只新增三篇 implementation 文档，未修改 DeepEP 源码。本文分析的实际上游源码基线是其父提交 `01dc3aaac82068020353dce2c302e38153c0bfaa`（`deepseek-ai/DeepEP` 的 `origin/main`，2026-08-04）；固定源码外链时应指向 `deepseek-ai/DeepEP@01dc3aaa`，不能使用 `deepseek-ai/DeepEP@f99f068`。外部资料访问日期为 2026-08-26；代码行号可能随上游演进而漂移，复现时应固定上述上游源码 commit。
@@ -15,6 +17,8 @@
 - **[官方背景]**：来自 DeepEP README、NVIDIA NCCL/CUDA 官方文档或论文，用于解释 API 与硬件语义；
 - **[源码推导]**：根据当前实现的数据布局、同步顺序或性能计数推导出的结论，尚不是稳定 API 承诺。
 
+> **源码摘录约定：**每个机制都给出项目内文件、符号或行号链接。代码块中的 `// ...`、`/* ... */` 只压缩与当前知识点无关的参数、循环或字段，不能脱离链接指向的完整源码直接编译；凡是教学伪代码都会明确标注“伪代码”，未标注者均保持真实控制分支和变量语义。
+
 根目录新增的三份深挖稿只覆盖 V1，可帮助理解 NVSHMEM、IBGDA、SM/warp 分工等历史背景，但**不能用来证明 V2 行为**。V2 的结论以 `deep_ep/buffers/elastic.py`、`csrc/elastic`、`deep_ep/include/deep_ep`、`tests/elastic`、仓库 README 以及 NCCL/CUDA 官方资料为准。
 
 ### 0.2 “Elastic” 到底指什么
@@ -22,6 +26,72 @@
 **[源码事实]** `ElasticBuffer` 的注释把 elastic 定义为底层内存形态的灵活性：纯 GPU、CPU 或混合内存。当前 EP 主路径使用 GPU symmetric segment；CPU/mixed segment 已用于 Engram，README 仍把通用 elastic GPU/CPU buffer 列为进行中能力。
 
 这里的 elastic **不是**分布式系统意义上的运行时成员弹性：当前实现没有在线增删 rank、communicator shrink/grow、故障重建或故障转移协议。构造阶段固定 `ProcessGroup`、NCCL communicator、world/LSA/Rail team 和窗口；运行期间所有 rank 仍需以一致顺序参与相应 collective、window registration、barrier 与 EP 调用。
+
+**源码跟读。** 定义就在 [`ElasticBuffer` 类注释](../deep_ep/buffers/elastic.py#L195)，构造函数则把“固定成员关系”和“内存形态”分成了两组参数：
+
+```python
+# deep_ep/buffers/elastic.py:228-245（节选）
+def __init__(self,
+             group: dist.ProcessGroup,
+             num_bytes: Optional[int] = None,
+             num_cpu_bytes: int = 0,
+             ...,
+             allow_hybrid_mode: bool = True,
+             allow_multiple_reduction: bool = True,
+             ...):
+```
+
+- `group` 在构造时给出，随后由 `group.rank()`、`group.size()` 固定 rank/world；源码没有更新它的接口。
+- `num_bytes/num_cpu_bytes` 决定注册窗口中 GPU、CPU 两种物理 segment 的容量，这才是当前代码中 “elastic” 的落点。
+- `allow_hybrid_mode` 改的是逻辑拓扑和 FULL/RAIL 连接方式，不改变 communicator 成员。
+- `allow_multiple_reduction` 改的是 combine 的 buffer plane 与规约时机，也不是 rank 弹性。
+
+构造末尾 [`elastic.py:344-367`](../deep_ep/buffers/elastic.py#L344) 创建 C++ runtime、读取固定 logical/physical domain，然后执行 CUDA/进程组同步。这解释了为什么不同 rank 必须以相同构造顺序和相同窗口大小进入初始化。
+
+### 0.3 V2 与 IBGDA 的精确边界：不用 NVSHMEM，但可能由 GDAKI 承载 GIN
+
+先给结论：**V2 没有调用 NVSHMEM，也没有 V1 的 NVSHMEM-IBGDA transport；V2 调用的是 NCCL Device API 的 GIN。** 但 GIN 是统一接口，不是单一硬件后端：NCCL 可把它实现为 GPU Direct NIC 的 GDAKI backend，也可实现为 CPU Proxy backend。因此下面三句话不能混用：
+
+1. “V2 不使用 NVSHMEM IBGDA”——正确；
+2. “V2 使用 NCCL GIN”——正确；
+3. “V2 一定完全不经过 IBGDA/GDAKI”——错误，实际 backend 由 NCCL 查询结果和运行环境决定。
+
+[`csrc/kernels/backend/nccl.cu:82-99`](../csrc/kernels/backend/nccl.cu#L82) 是 transport 选择的源码证据：
+
+```cpp
+ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
+ncclCommQueryProperties(comm, &props);
+if (num_ranks > 1 && get_env("EP_DISABLE_GIN", 0) == 0) {
+    EP_HOST_ASSERT((allow_hybrid_mode ? props.railedGinType : props.ginType)
+                   != NCCL_GIN_TYPE_NONE);
+    reqs.ginContextCount = num_allocated_qps;
+    reqs.ginExclusiveContexts = true;
+    reqs.ginConnectionType = allow_hybrid_mode
+        ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_FULL;
+}
+```
+
+逐行解释：
+
+- `ncclCommQueryProperties` 查询 NCCL 已选择/可提供的能力；DeepEP 只检查 `ginType` 或 `railedGinType` 是否为 `NONE`，**没有断言它必须等于 GDAKI**。
+- direct 需要任意 peer 可达的 `FULL` connection；hybrid 只沿同 rail 跨 scale-out 通信，申请 `RAIL` connection。
+- `ginContextCount` 对应预分配 QP/context 数，`ginExclusiveContexts=true` 表示这些 context 不和别的 device operation 共享。
+- `EP_DISABLE_GIN=1` 只是跳过 GIN requirement 的建立；代码里没有另一套跨节点 transport 自动接管，因此不能把它当成多节点 fallback 开关。
+
+数据路径只看到统一的 [`handle::NCCLGin::put`](../deep_ep/include/deep_ep/common/handle.cuh#L175)：它把目标地址编码为 `window + offset` 后调用 `gin.put(...)`；内核不直接构造 NVSHMEM WQE。源码中个别注释仍写 “IBGDA requests”，例如 [`hybrid_dispatch.cuh:444-454`](../deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh#L444)，这是沿用 GPU-initiated RDMA 的历史术语，不能推翻实际 API 层是 NCCL GIN 的事实。
+
+还要保留一个当前实现边界：[`common/comm.cuh:166-176`](../deep_ep/include/deep_ep/common/comm.cuh#L166) 为了实现带 timeout 的 barrier signal polling，直接把 `gin._ginHandle` 转成 `ncclGinGdakiGPUContext*` 并读取 `signals_table.buffer`：
+
+```cpp
+// TODO(NCCL): wait for an official signal-wait API with timeout
+const auto gdaki =
+    static_cast<ncclGinGdakiGPUContext*>(gin._ginHandle) + gin.contextId;
+const auto signal_ptr =
+    reinterpret_cast<uint64_t*>(gdaki->signals_table.buffer) + signal_idx;
+const auto signal = ptx::ld_acquire_sys<uint64_t>(signal_ptr);
+```
+
+所以从接口设计上说 GIN 可为 GDAKI 或 Proxy；从本 commit 的完整可运行路径说，**至少这个自定义 barrier 轮询仍耦合 GDAKI 内部结构**。在声称 Proxy backend 可端到端运行前，必须逐路径验证 barrier、PP 等 signal wait，而不能只看 `props.ginType != NONE`。
 
 ## 1. V2 解决了什么问题
 
@@ -92,7 +162,7 @@ flowchart TD
 
 V2 不再把“每节点恰好 8 卡”硬编码到 EP 算法。NCCL backend 查询：
 
-- `num_rdma_ranks`：物理 scale-out/RDMA 域大小；
+- `num_rdma_ranks = world_size / LSA_size`：LSA 域的数量，也是代码中的逻辑 scale-out 维度；它不是 NIC/HCA/QP 的物理数量；
 - `num_nvl_ranks`：NCCL LSA team 的 NVLink 域大小。
 
 然后依据 `allow_hybrid_mode` 构造逻辑域：
@@ -257,6 +327,37 @@ max tokens、alignment、FP8 scale pack、cached/CPU-sync/expand 模式等
 4. 加载 cubin/module；
 5. 以参数 hash 缓存；
 6. 后续调用直接复用。
+
+生成端的实际代码（[`launch_runtime.hpp:33-45`](../csrc/jit/launch_runtime.hpp#L33)）：
+
+```cpp
+auto code = Derived::generate_impl(args);
+static std::string include_hash;
+if (include_hash.empty())
+    include_hash = include_parser->get_hash_value(code);
+code = fmt::format("// Includes' hash value: {}\n{}",
+                   include_hash, code);
+```
+
+`generate_impl(args)` 把 topology、SM/warp/QP、shape 与模式布尔量写进唯一模板实例；递归 `<deep_ep/*>` include hash 让头文件变化进入缓存签名。编译缓存的关键代码（[`compiler.hpp:111-159`](../csrc/jit/compiler.hpp#L111)）：
+
+```cpp
+const auto kernel_signature =
+    fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+const auto dir_path = cache_dir_path / "cache" /
+    fmt::format("kernel.{}.{}", name,
+                get_hex_digest(kernel_signature));
+if (const auto runtime = kernel_runtime_cache->get(dir_path);
+    runtime != nullptr)
+    return runtime;
+
+compile(code, tmp_dir_path, tmp_cubin_path);
+fsync_dir(tmp_dir_path);
+std::filesystem::rename(tmp_dir_path, dir_path, error_code);
+return kernel_runtime_cache->get(dir_path);
+```
+
+临时目录 + `fsync` + directory rename 使多个 rank 并发首编译时只复用胜者的完整目录，避免读到半写入 CUBIN；signature 同时覆盖 kernel 名、NVCC 版本/flags 和生成源码。
 
 相关环境变量：
 
@@ -532,9 +633,9 @@ flowchart LR
 | `num_max_tokens_per_rank` | source global index 的编码基数和 buffer 上界 |
 | `num_sms` | combine 默认复用 dispatch SM 数 |
 | `topk_idx` | 防用户修改的路由副本；combine 的目标和 cached dispatch 的 routing |
-| `num_recv_tokens` | normal 实际/估计接收数 |
-| `num_expanded_tokens` | expanded 实际/估计大小 |
-| `num_recv_tokens_per_expert_list` | CPU grouped GEMM metadata |
+| `num_recv_tokens` | CPU-sync 时是实际数；fresh no-sync 时是 normal capacity；cached 时复用原 handle 值 |
+| `num_expanded_tokens` | CPU-sync 时是实际大小；fresh no-sync 时是 expanded capacity；cached 时复用 |
+| `num_recv_tokens_per_expert_list` | CPU-sync/new exact handle 的 grouped GEMM host metadata；fresh no-sync 新 handle 保持空列表 |
 | `psum_num_recv_tokens_per_scaleup_rank` | rank prefix，no-CPU-sync 时给出 GPU 真实数 |
 | `psum_num_recv_tokens_per_expert` | expert prefix |
 | `num_unaligned_recv_tokens_per_expert` | padding 前 count |
@@ -645,6 +746,8 @@ local expert rows
 - 写 `combined_x[num_original_tokens, hidden]`。
 
 V2 combine 对 hidden 向量执行的是**不乘 `topk_weights` 的加法规约**；传入的 `topk_weights` 被通信并重建为独立的 `combined_topk_weights` 输出。若模型要求 gate 权重作用于 expert 输出，应在调用 combine 前由上层/GEMM epilogue 完成，不能仅因传入了 `topk_weights` 就假设 DeepEP 会对 hidden 自动加权。
+
+组合边界：expanded combine 且 `allow_multiple_reduction=False` 时，设备 `kDoExpandedSend` 分支断言 `topk_weights == nullptr`；只有允许 multiple reduction 的 expanded 路径才支持随返回值重建 expanded weights。
 
 ## 21. SM 数解析估算
 
@@ -944,7 +1047,7 @@ direct:
 world_rank = scaleout_rank_idx * num_scaleup_ranks + scaleup_rank_idx
 ```
 
-例如 4 个 LSA 域、每域 8 卡的 EP32，物理大小为 `(num_rdma_ranks, num_nvl_ranks)=(4,8)`，world rank 19 的逻辑坐标是 `(2,3)`。若关闭 hybrid，逻辑坐标退化为 `(0,19)`；这**不表示** 32 张卡突然都具备物理 NVLink 直连，只表示 direct kernel 对每个 peer 再选择 LSA bypass 或 Gin。
+例如 4 个 LSA 域、每域 8 卡的 EP32，代码的域分解大小为 `(num_rdma_ranks, num_nvl_ranks)=(4,8)`；第一个 4 是 LSA 域数量，不是 4 张 NIC。world rank 19 的逻辑坐标是 `(2,3)`。若关闭 hybrid，逻辑坐标退化为 `(0,19)`；这**不表示** 32 张卡突然都具备物理 NVLink 直连，只表示 direct kernel 对每个 peer 再选择 LSA bypass 或 Gin。
 
 ### 30.2 Direct dispatch：一次到最终 rank
 
@@ -967,7 +1070,7 @@ sequenceDiagram
         SH->>D: TMA store 到 symmetric pointer
     else 非 LSA peer
         SH->>L: TMA store 到本地 staging
-        L->>D: Gin FULL put + signal
+        L->>D: Gin FULL put（完成由末尾 barrier 建立）
     end
 ```
 
@@ -1105,7 +1208,7 @@ expanded: world_size * max_tokens_per_rank * min(topk, local_experts)
           + expert alignment gaps，再按布局要求对齐
 ```
 
-此时 Python 返回的 `num_recv_tokens`/per-expert list 可能是容量估计，GPU prefix 的末项才携带实际有效规模。allocated rows 不等于 valid rows。
+fresh no-CPU-sync 时，Python handle 的 `num_recv_tokens`/`num_expanded_tokens` 是容量；新建的 `num_recv_tokens_per_expert_list` 保持空列表，而不是容量估计。实际 rank/expert 规模在 GPU prefix/count tensor 中，allocated rows 不等于 valid rows。cached 模式只复用原 handle 已有的 host list。
 
 cached 模式重用 slot 与 metadata，正确性前提是 top-k 路由、rank 映射、`do_expand`、alignment、max-token 上界和相应 handle 语义不变。可选的新 `topk_weights` 只更新权重数据，不会重新计算 destination slot。
 
@@ -1156,7 +1259,7 @@ barrier 复用 LSA/Gin signal 与 timeout，可选择 GPU-only、CPU sync 和顺
 
 **[源码事实]** `pp_set_config` 只配置 ring 邻居（前一 rank/后一 rank）、最大 bytes 与最大 inflight。workspace 为每方向维护多组循环 slot；`send_count % inflight` 选择可复用 slot。
 
-send 顺序为：等远端 release → TMA 将用户 tensor 写到 symmetric send slot → 选出的线程发起 world-team Gin put 并附带 arrival signal。recv 顺序为：等 arrival → TMA 从 slot 拷到用户 tensor → 向 sender 发 release，允许该 slot 再用。
+send 顺序为：等远端 release → TMA 将用户 tensor 写到 symmetric send slot → 选出的线程发起 world-team Gin put 并附带 arrival signal。recv 顺序为：等 arrival → TMA 从 slot 拷到用户 tensor → 向 sender 发 release，允许该 slot 再用。除 contiguous/容量约束外，设备 `tma_copy` 还断言 `x.nbytes() % 32 == 0`。
 
 “0 SM PP”只应描述 **Gin/RDMA 已 issue 到 wait 之间的网络 in-flight 窗口**；send/recv 的 staging、signal wait 与拷贝 kernel 仍占 SM。测试通过在 send 与 recv/wait 之间插入 GPU sleep/compute 来验证隐藏窗口。当前接口是固定邻居协议，不是任意 peer 的通用点对点层。
 
@@ -1236,7 +1339,7 @@ README 表头称这些数值为 **bottleneck bandwidth**，但其注释又将统
 8. direct/hybrid、SM/QP、CPU-sync/cached/expanded/multiple-reduction/deterministic；
 9. 是否冷 JIT、是否 flush L2、是否与真实 compute 重叠。
 
-自动 SM 估算会调用外部工具解析 RDMA/NVLink 带宽；查询失败可能退化为 0。生产实验应查看 `EP_BUFFER_DEBUG=1`，必要时显式提供 `rdma_gbs/nvlink_gbs` 并校准默认每 SM HBM read/write 假设。当前 estimator 的 TODO 明确不精确支持 expanded、multiple reduction 与 group-limited gate，且默认 balanced gate。
+自动 SM 估算会调用外部工具解析 RDMA/NVLink 带宽；查询失败返回 0，而后续 estimator 仍可能以该值做除法，导致除零或无效估算。生产实验应查看 `EP_BUFFER_DEBUG=1`，探测失败时显式提供非零 `rdma_gbs/nvlink_gbs`，并校准默认每 SM HBM read/write 假设。当前 estimator 的 TODO 明确不精确支持 expanded、multiple reduction 与 group-limited gate，且默认 balanced gate。
 
 ### 35.4 Correctness matrix 先于性能矩阵
 
@@ -1342,6 +1445,244 @@ combine_reduce_epilogue_impl
 | 确定性范围 | `EPHandle.deterministic_sort` 与 `test_ep.py` | 源码事实 |
 | 性能公式、hybrid 适用性 | 源码流量计数 + 受控实验 | 源码推导 |
 | PP/Engram/AGRS 能力边界 | API、kernel 与 `tests/elastic` | 源码事实 |
+
+#### 37.1.1 知识点 → 源码符号 → 运行时作用完整索引（EP 主链）
+
+| 知识点 | 项目代码位置 / 符号 | 代码在运行时做什么 |
+|---|---|---|
+| Elastic 含义/构造 | [`elastic.py:195-367`](../deep_ep/buffers/elastic.py#L195) `ElasticBuffer.__init__`、[`buffer.hpp:97-135`](../csrc/elastic/buffer.hpp#L97) | 固定 communicator，选择 GPU/CPU memory 容量，建立 C++ runtime/workspace |
+| physical/logical domain | [`nccl.cu:49-59`](../csrc/kernels/backend/nccl.cu#L49)、[`110-125`](../csrc/kernels/backend/nccl.cu#L110) | 从 world/LSA team 得物理大小，再生成 direct/hybrid 逻辑坐标 |
+| GIN FULL/RAIL/QP | [`nccl.cu:82-108`](../csrc/kernels/backend/nccl.cu#L82) `NCCLSymmetricMemoryContext` | 查询 GIN 能力，申请 exclusive contexts、queue depth、signal 与 traffic class |
+| symmetric window | [`nccl.cu:127-152`](../csrc/kernels/backend/nccl.cu#L127) | 分配 symmetric memory，以 `STRICT_ORDERING` 注册 window，取得 LSA pointer |
+| GPU/CPU/mixed memory | [`symmetric.hpp:291-310`](../csrc/kernels/backend/symmetric.hpp#L291) `symmetric::alloc` | 在 GPU-only、elastic mixed、hybrid CPU segment allocator 间分流 |
+| JIT 生成/缓存 | [`launch_runtime.hpp:33-45`](../csrc/jit/launch_runtime.hpp#L33)、[`compiler.hpp:111-239`](../csrc/jit/compiler.hpp#L111) | shape/topology/mode 模板化，hash include+flags，原子落盘并加载 CUBIN |
+| buffer size | [`buffer.hpp:616-685`](../csrc/elastic/buffer.hpp#L616) | 分别求 dispatch/combine direct/hybrid worst case，取 max 并对齐 |
+| SM/QP 估算 | [`elastic.py:729-853`](../deep_ep/buffers/elastic.py#L729) | 由路由概率、SO/SU/HBM 带宽估 SM；按 direct/hybrid 公式映射 QP |
+| host dispatch 主链 | [`buffer.hpp:968-1176`](../csrc/elastic/buffer.hpp#L968) | 清 counter、launch main、CPU/no-sync/cached 分配、launch copy epilogue |
+| notify/prefix | [`dispatch.cuh:92-257`](../deep_ep/include/deep_ep/impls/dispatch.cuh#L92) | 对 rank 去重、对 expert 逐项计数，跨 SM reduce 后生成 aligned prefix |
+| direct dispatch | [`dispatch.cuh:277-400`](../deep_ep/include/deep_ep/impls/dispatch.cuh#L277) `dispatch_impl` | TMA stage；LSA peer 直写，否则 local staging + GIN FULL put |
+| hybrid dispatch | [`hybrid_dispatch.cuh:330-638`](../deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh#L330) | scale-out warp 做 Rail put，forward warp acquire tail 后 LSA fan-out |
+| copy epilogue | [`dispatch_copy_epilogue.cuh:58-205`](../deep_ep/include/deep_ep/impls/dispatch_copy_epilogue.cuh#L58) | PDL wait、prefix 映射、normal/expanded row 写出、metadata/zero gap |
+| EPHandle/cached/no-sync | [`elastic.py:25-192`](../deep_ep/buffers/elastic.py#L25)、[`926-1027`](../deep_ep/buffers/elastic.py#L926) | 保存路由与 slot/prefix；校验 cached 模式；wait 后 deterministic sort |
+| host combine 主链 | [`buffer.hpp:1249-1342`](../csrc/elastic/buffer.hpp#L1249) | 校验 handle、launch combine、分配输出、等待依赖、launch reduce epilogue |
+
+| 知识点 | 项目代码位置 / 符号 | 代码在运行时做什么 |
+|---|---|---|
+| direct combine | [`combine.cuh:71-240`](../deep_ep/include/deep_ep/impls/combine.cuh#L71) `combine_impl` | 恢复 source metadata，TMA load，LSA store 或 GIN put，建立 arrival barrier |
+| hybrid combine | [`hybrid_combine.cuh:340-490`](../deep_ep/include/deep_ep/impls/hybrid_combine.cuh#L340) | scale-up linked list 消费、可选部分规约、Rail 发送与 source fan-in |
+| multiple reduction | [`buffer.hpp:623-648`](../csrc/elastic/buffer.hpp#L623) | 改变 reduction plane 数、buffer 字节和 BF16 中间规约分组 |
+| reduce epilogue | [`combine_reduce_epilogue.cuh:57-139`](../deep_ep/include/deep_ep/impls/combine_reduce_epilogue.cuh#L57) | 计算 top-k plane、FP32 累加/bias、写 hidden并独立重建 weights |
+| GIN put/flush/signal | [`handle.cuh:146-197`](../deep_ep/include/deep_ep/common/handle.cuh#L146) `NCCLGin` | window+offset one-sided put；flush 只保证源可复用；remote signal另建可见性边界 |
+| TMA/PDL | [`dispatch.hpp:225-336`](../csrc/kernels/elastic/dispatch.hpp#L225)、[`jit/handle.hpp:149-154`](../csrc/jit/handle.hpp#L149) | global↔shared/symmetric staging；主 kernel trigger，epilogue dependency sync |
+| stream/event | [`buffer.hpp:526-583`](../csrc/elastic/buffer.hpp#L526) `stream_control_*` | compute/comm stream 依赖、前后 event 与 allocator record 三者分离 |
+| barrier/timeout | [`comm.cuh:166-269`](../deep_ep/include/deep_ep/common/comm.cuh#L166)、[`buffer.hpp:181-207`](../csrc/elastic/buffer.hpp#L181) | LSA/GIN barrier、signal acquire polling、cycle timeout与stream回接 |
+| PP | [`pp_send_recv.cuh:132-210`](../deep_ep/include/deep_ep/impls/pp_send_recv.cuh#L132) | ring slot release→TMA stage→GIN put+arrival→recv+release |
+| Engram | [`engram_fetch.cuh:43-104`](../deep_ep/include/deep_ep/impls/engram_fetch.cuh#L43) | mixed segment GIN get，按 peer/QP 聚合并以 async flush request 等待 |
+| AGRS | [`buffer.hpp:377-523`](../csrc/elastic/buffer.hpp#L377) | 仅 LSA domain 的 batched peer copy+signal All-Gather session |
+| benchmark | [`test_ep.py:239-357`](../tests/elastic/test_ep.py#L239)、[`testing.py:24-180`](../deep_ep/utils/testing.py#L24) | 定义 SO/SU token 去重、copy/reduce 字节与 main/epilogue 独立计时 |
+| timeout | [`elastic.py:245`](../deep_ep/buffers/elastic.py#L245)、[`buffer.hpp:1019-1063`](../csrc/elastic/buffer.hpp#L1019) | 区分库默认 CPU/GPU 秒数、host wall-clock poll 与 device cycle watchdog |
+
+#### 37.1.2 关键机制的实际代码伴读
+
+**拓扑与 window。** [`nccl.cu:49-59`](../csrc/kernels/backend/nccl.cu#L49)、[`127-152`](../csrc/kernels/backend/nccl.cu#L127)：
+
+```cpp
+num_nvl_ranks = ncclTeamLsa(comm).nRanks;
+num_rdma_ranks = num_ranks / num_nvl_ranks;
+if (allow_hybrid_mode) {
+    num_scaleout_ranks = num_rdma_ranks;
+    num_scaleup_ranks = num_nvl_ranks;
+} else {
+    num_scaleout_ranks = 1;
+    num_scaleup_ranks = num_ranks;
+}
+
+symmetric_memory = symmetric::alloc(/* GPU/CPU bytes and topology */);
+ncclCommWindowRegister(comm, symmetric_memory->ptr,
+                       symmetric_memory->num_bytes, &window,
+                       NCCL_WIN_STRICT_ORDERING);
+ncclGetLsaDevicePointer(window, 0, nvl_rank_idx,
+                        &mapped_window_ptr);
+```
+
+前四行只改变逻辑坐标，不创造新的物理 NVLink；window registration 是 collective。`mapped_window_ptr` 是本 rank 的 LSA base，peer 地址由 window+offset 或 `get_sym_ptr` 翻译，而不是假设各 rank 原始 VA 相同。`STRICT_ORDERING` 是当前 VA signal/put 顺序协议的基础之一。
+
+**Direct dispatch。** 下面摘自 [`dispatch.cuh:277-400`](../deep_ep/include/deep_ep/impls/dispatch.cuh#L277)；只用 `// ...` 省略 SF/metadata 等不影响该分支的语句，变量名和条件均保留源码：
+
+```cpp
+const auto token_start = dispatch_warp_idx * kNumSMs + sm_idx;
+const auto token_stride = kNumDispatchWarps * kNumSMs;
+for (int token_idx = token_start; token_idx < num_tokens;
+     token_idx += token_stride) {
+    if (ptx::elect_one_sync())
+        ptx::tma_load_1d(tma_buffer.get_hidden_ptr(),
+            math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
+            mbarrier_ptr, kNumHiddenBytes);
+    // ... load top-k/SF/source metadata ...
+    if constexpr (kReuseSlotIndices) {
+        stored_dst_slot_idx = __ldg(
+            dst_buffer_slot_idx + token_idx * kNumTopk + lane_idx);
+    } else if (ptx::deduplicate(stored_dst_rank_idx, lane_idx)
+               and stored_dst_rank_idx >= 0) {
+        stored_dst_slot_idx = atomicAdd(
+            workspace_layout.get_scaleup_atomic_sender_counter()
+            + stored_dst_rank_idx, 1);
+    }
+
+    const auto dst_ptr = stored_dst_slot_idx >= 0 ?
+        gin.get_sym_ptr<team_t>(
+            recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+            stored_dst_rank_idx) : nullptr;
+    if (dst_ptr != nullptr)
+        ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(),
+                          tma_buffer.get_num_bytes<false>());
+    // ... local registered send-buffer TMA and wait ...
+    if (stored_dst_slot_idx >= 0 and dst_ptr == nullptr)
+        gin.put<team_t>(
+            recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+            send_buffer_ptr, tma_buffer.get_num_bytes<false>(),
+            stored_dst_rank_idx);
+}
+```
+
+token 按 warp/channel stride 分工；同 rank 的多个 expert selection 经 notify/data 路径去重，hidden 只发一次。LSA peer 返回可直接寻址 pointer，非 LSA peer 先 TMA 落到 registered local staging，再做 GIN FULL put。这里 `put` 没附 remote signal；远端完成/复用由末尾 barrier 协议建立。
+
+**Hybrid 的发布/消费协议。** Scale-out warp 在 [`hybrid_dispatch.cuh:447-454`](../deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh#L447) 发 Rail put：
+
+```cpp
+gin.put<ncclTeamTagRail>(
+    scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx)
+        .get_base_ptr(),
+    scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
+    tma_buffer.get_num_bytes<false>(),
+    stored_dst_scaleout_rank_idx,
+    ncclGinOptFlagsAggregateRequests);
+```
+
+payload 批量提交后，sender 以 release reduction 更新远端 signaled tail（[`hybrid_dispatch.cuh:344-347`](../deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh#L344)）；forward warp 以 system acquire 读取并解包（[`518-522`](../deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh#L518)）：
+
+```cpp
+gin.red_add_rel<ncclTeamTagRail>(
+    ptr, signaled_tail - old_signaled_tail, lane_idx);
+
+const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
+    workspace_layout.get_scaleout_channel_signaled_tail_ptr(
+        channel_idx, lane_idx));
+math::unpack2<int, int64_t>(signaled_tail,
+                            stored_finish_flag,
+                            stored_scaleout_tail_idx);
+```
+
+这组 release/acquire 才是 forwarder 读取 scale-out slot 的消费边界；裸 `gin.put` 返回或本地 TMA 完成都不能单独证明远端可读。随后 forward warp 再从 top-k metadata 计算目标 scale-up rank，并用 LSA symmetric pointer 做节点内 fan-out。
+
+**Combine 与 epilogue。** 下面是 [`combine.cuh:121-242`](../deep_ep/include/deep_ep/impls/combine.cuh#L121) 的真实控制分支；`// ...` 只省略 lambda 参数和展开循环：
+
+```cpp
+auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
+auto no_local_reduce = not kUseExpandedLayout or
+    (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
+if (no_local_reduce) {
+    // TMA one row into master_token_buffer
+} else if constexpr (kAllowMultipleReduction) {
+    combine_reduce<kHiddenVec, kUnrollFactor,
+                   math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
+        lane_idx, topk_slot_idx,
+        static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+        /* source lambda */, /* wait lambda */);
+    if (ptx::elect_one_sync())
+        ptx::tma_store_1d(master_token_buffer.get_base_ptr(),
+                          tma_buffer.get_base_ptr(), kNumHiddenBytes);
+} else {
+    // No local reduction: loop over k and send every expanded plane
+    gin.put<team_t>(token_buffer.get_base_ptr(),
+                    send_token_buffer.get_base_ptr(),
+                    kNumHiddenBytes, src_rank_idx);
+}
+
+if (not kDoExpandedSend and not nvlink_bypass
+    and ptx::elect_one_sync()) {
+    ptx::tma_store_wait();
+    const auto dst_ptr = recv_buffer
+        .get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx)
+        .get_token_buffer(src_token_idx).get_base_ptr();
+    gin.put<team_t>(dst_ptr, master_token_buffer.get_base_ptr(),
+                    master_token_buffer.get_num_bytes<false>(), src_rank_idx);
+}
+comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                  kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
+                  comm::kCombineTag1, true, true, false>(
+    gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+```
+
+`allow_multiple_reduction=True` 允许先把若干 contribution 形成 BF16 中间部分和，减少 plane/网络字节但改变舍入分组；关闭时保留 contribution 到最终 epilogue。末尾 barrier 而不是 `flush()` 单独保证目标可见。
+
+Reduce epilogue 开头先等待 PDL 依赖（[`combine_reduce_epilogue.cuh:57-139`](../deep_ep/include/deep_ep/impls/combine_reduce_epilogue.cuh#L57)）：
+
+```cpp
+cudaGridDependencySynchronize();
+// combine_reduce(...) has produced the hidden/bias result in tma_buffer
+if (ptx::elect_one_sync()) {
+    ptx::tma_store_1d(
+        output_buffer.get_token_buffer(token_idx).get_base_ptr(),
+        tma_buffer.get_base_ptr(), kNumHiddenBytes);
+    ptx::tma_store_commit();
+}
+
+if (combined_topk_weights != nullptr) {
+    const auto master_lane_idx =
+        ptx::get_master_lane_idx(ptx::match(stored_dst_rank_idx));
+    if (lane_idx < kNumTopk) {
+        float value = 0;
+        if (stored_dst_rank_idx >= 0) {
+            const auto dst_ptr = comm_buffer
+                .get_rank_buffer(kUseRankLayout ?
+                    stored_dst_rank_idx : master_lane_idx)
+                .get_token_buffer(token_idx)
+                .get_topk_weights_ptr() + lane_idx;
+            value = *dst_ptr;
+        }
+        combined_topk_weights[token_idx * kNumTopk + lane_idx] = value;
+    }
+}
+```
+
+hidden 由 `combine_reduce` 加法/可选 bias 产生；weights 从通信 buffer 的独立 metadata 地址复制。两条数据流没有 `hidden *= weight`，所以不能把“传入 topk weights”解释为 DeepEP 自动 gate-weighted combine。
+
+**Stream 与 PDL。** Host 编排的关键行位于 [`buffer.hpp:526-583`](../csrc/elastic/buffer.hpp#L526)：
+
+```cpp
+const auto compute_stream = at::cuda::getCurrentCUDAStream();
+if (allocate_on_comm_stream)
+    at::cuda::setCurrentCUDAStream(comm_stream);
+if (previous_event.has_value())
+    stream_wait(comm_stream, previous_event.value());
+else
+    stream_wait(comm_stream, compute_stream);
+
+if (async_with_compute_stream) {
+    event = EventHandle(comm_stream);
+    for (auto& t: tensors) if (t.has_value()) {
+        t->record_stream(compute_stream);
+        t->record_stream(comm_stream);
+    }
+} else {
+    stream_wait(compute_stream, comm_stream);
+}
+```
+
+前半建立执行依赖；返回 event 表示完成边界；`record_stream` 保护 allocator 生命周期，三者不能互换。`previous_event_before_epilogue` 还可单独推迟 epilogue，让 main 通信与另一段计算重叠。
+
+PDL launch 属性在 [`csrc/jit/handle.hpp:149-154`](../csrc/jit/handle.hpp#L149) 设置：
+
+```cpp
+if (enable_pdl) {
+    auto& attr = attrs[config.numAttrs++];
+    attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    attr.value.programmaticStreamSerializationAllowed = 1;
+}
+```
+
+主 kernel 末尾调用 `cudaTriggerProgrammaticLaunchCompletion()`，epilogue 开头调用 `cudaGridDependencySynchronize()`。PDL 只让依赖 kernel 更早启动/执行无依赖前导，不绕过 payload barrier、TMA completion 或 GIN 到达协议。
 
 ### 37.2 外部一手资料
 

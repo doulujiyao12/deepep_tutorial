@@ -1,5 +1,7 @@
 # DeepEP V1 SM 通信方案详解
 
+[六篇学习目录](reading-guide.md) · [IBGDA 原理前置教程](tutorial-ibgda-principles.md) · [CPU-assisted 与部署](tutorial-nvshmem-deployment.md) · [HTML 阅读版](html/implementation-v1-sm.html)
+
 > 本文对应仓库中的 **V1 legacy normal / high-throughput** 路径。这里的“SM 通信方案”指由常驻 CUDA 通信内核占用一定数量的 SM，使用 GPU 线程主动完成队列管理、数据搬运、NVLink 访问和 IBGDA RDMA 发起的方案；它不是 V1 的 `low_latency_dispatch/low_latency_combine` 路径。
 > **研究双基线：**本地教程文档基线为 `f99f06868616c6fa96f83ff1caa5f0231f9ee3bc`（2026-08-25），该提交仅新增三篇 implementation 文档；实际 DeepEP 上游源码基线为其父提交 `01dc3aaac82068020353dce2c302e38153c0bfaa`（deepseek-ai `origin/main`，2026-08-04）。本文在 2026-08-26 重新核对了该上游源码、仓库新增的两份专题研究稿、DeepSeek-V3 技术报告以及 NVIDIA CUDA/NVSHMEM 官方文档。仓库 `docs/legacy.md` 明确提示开源实现可能与论文略有不同；二者冲突时，本文描述“上述上游源码 commit 怎么做”，论文只用于解释设计背景。
 
@@ -8,6 +10,8 @@
 - **【源码可证】**：能由上述上游源码 commit 的代码、注释、断言或测试直接确认。
 - **【官方资料背景】**：来自 DeepEP/DeepSeek 或 NVIDIA 官方文档，用于解释设计动机和硬件语义。
 - **【推导/调优假设】**：由源码结构推演出的性能模型、故障假设或实验建议；需要在目标集群上测量，不能当成实现保证。
+
+> **源码摘录约定：**每个机制都给出项目内文件、符号或行号链接。代码块中的 `// ...`、`/* ... */` 只压缩与当前知识点无关的参数、循环或字段，不能脱离链接指向的完整源码直接编译；凡是教学伪代码都会明确标注“伪代码”，未标注者均保持真实控制分支和变量语义。
 
 ## 1. 方案定位
 
@@ -30,7 +34,212 @@ gate/top-k
   -> combine
 ```
 
-### 1.1 经典双 micro-batch 重叠图
+### 1.1 先讲清 IBGDA：它解决什么、V1 normal 在哪里使用
+
+#### 1.1.1 IBGDA 把逐消息 RDMA 控制面下沉到 GPU
+
+IBGDA 是 **InfiniBand GPU Direct Async**。GPU Direct RDMA 解决“NIC 能否直接 DMA GPU 显存”，IBGDA 进一步解决“谁来准备并提交网络工作”。即使 NIC 已能 DMA GPU HBM，非 IBGDA 路径仍可能需要 CPU/proxy thread 将 GPU 的通信意图转换成 verbs work request、提交 WQE 并敲 doorbell；IBGDA 让 GPU 直接访问 NIC work queue、doorbell record 和 completion queue。
+
+不使用 IBGDA、由 host/proxy 逐消息推进的典型路径是：
+
+```mermaid
+sequenceDiagram
+    participant K as GPU kernel
+    participant H as Host/proxy thread
+    participant W as NIC send WQ
+    participant N as NIC
+    participant R as Remote GPU HBM
+    K->>H: descriptor / signal
+    H->>H: 构造 WR/WQE
+    H->>W: post_send + doorbell
+    W->>N: NIC 获取 WQE
+    N->>R: PCIe/IB RDMA DMA
+    N-->>H: CQE/progress
+    H-->>K: completion flag
+```
+
+这种路径兼容性和 CPU 端协议灵活性较好，也能服务于不能把 NIC doorbell 映射给 GPU 的平台；代价是小消息会经历 GPU→CPU 通知、proxy 调度和 CPU→NIC 提交，可能引入 CPU 抖动、NUMA/PCIe 控制流往返与同步。
+
+traditional IBGDA 的热路径则是：
+
+```mermaid
+sequenceDiagram
+    participant S as DeepEP sender warp
+    participant Q as GPU-visible WQ/DBR
+    participant D as NIC doorbell
+    participant N as NIC
+    participant R as Remote symmetric HBM
+    participant C as GPU-visible CQ
+    S->>S: 查 lkey/rkey，保留 WQE slot
+    S->>Q: 写 ctrl/raddr/data/atomic segment
+    S->>Q: threadfence 后推进 ready/prod index
+    S->>D: 更新 DBR 并 ring doorbell
+    D->>N: NIC 拉取 WQE
+    N->>S: DMA 读取本地 payload
+    N->>R: RDMA write / atomic
+    N-->>C: 写 CQE
+    S->>C: quiet 时轮询完成
+```
+
+IBGDA 省掉的是**逐消息** CPU/proxy 控制，不是所有 host 工作。启动时 host 仍负责 NVSHMEM bootstrap、QP/CQ 创建、显存注册、key/PE 信息交换和资源销毁；GPU 只在这些资源建好后直接发 WQE。好处是 GPU 路由/组包后可立即提交 RDMA，并与 NVLink forwarding 流水化；代价是 warp 要查 key、填 WQE、同步、敲 doorbell和轮询 CQ，QP/WQ/CQ 也占 GPU/NIC 资源。
+
+仓库 [`docs/nvshmem.md:32-56`](nvshmem.md#2-enable-nvshmem-ibgda-support) 还列出两种 **都属于 IBGDA** 的部署：
+
+- traditional IBGDA：通过 NVIDIA driver regkeys 打开能力，GPU 生成 WR 并管理 NIC 控制面；
+- CPU-assisted asynchronous post-send IBGDA：安装 GDRCopy 并加载 `gdrdrv`；GPU 仍生成 WR，CPU 只辅助 doorbell-ringing，项目文档注明有小幅性能损失。
+
+第二种不是“完全未使用 IBGDA”的 host/proxy transport。NVIDIA 官方将它描述为 traditional IBGDA 与 proxy-based transport 之间的兼容模式；DeepEP 只显式请求 `NVSHMEM_IB_ENABLE_IBGDA=1`，具体 post-send 方式由部署和 NVSHMEM 决定。
+
+#### 1.1.2 V1 normal 的使用边界和初始化代码
+
+| 场景 | 数据路径 | IBGDA | 通信 SM |
+|---|---|---:|---:|
+| 单节点，`num_rdma_ranks == 1` | CUDA IPC + NVLink | 标准 normal 构造不初始化/不使用；兼容 LL 的构造可初始化，但本次 normal 调用仍不走 IBGDA | sender/receiver block 仍占用 |
+| 跨节点，`num_rdma_ranks > 1` | 同号 GPU 间 IBGDA，再 NVLink fan-out | 使用 | sender/coordinator/forwarder/receiver 均占用 |
+
+Python 分支直接证明这条边界（[`legacy.py:103-135`](../deep_ep/buffers/legacy.py#L103)，以下均为固定上游 commit 的节选）：
+
+```python
+root_unique_id = None
+if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+    os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+    os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+    self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
+    os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+    # gather NVSHMEM unique ID ...
+self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+```
+
+- canonical normal 下 `low_latency_mode=False`，只有 `get_num_rdma_ranks()>1` 才进入分支。若为兼容 LL 以 `low_latency_mode=True` 构造，单节点也会初始化 NVSHMEM/IBGDA；但 Python 仍把该次 normal dispatch/combine 分流到 intranode kernel，数据面不执行 IBGDA。
+- `NVSHMEM_IBGDA_NUM_RC_PER_PE` 配置每个目标 PE 的 RC QP 数。
+- QP depth 是在途 WR 容量。源码注释说 DeepEP 让它大于在途 WR以省去热路径逐次 slot 检查，但队列并非无限。
+- `NVSHMEM_CUMEM_GRANULARITY=2^29` 是 512 MiB allocation/registration 粒度；逻辑 put 跨实际注册 chunk 时仍拆 WQE。
+- unique ID 用于 bootstrap，Python 不参与后续逐消息发起。
+
+C++ 将 normal 的 NVSHMEM PE 定义成 `rdma_rank`，而不是全局 rank（[`buffer.hpp:255-285`](../csrc/legacy/buffer.hpp#L255)）：
+
+```cpp
+auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
+auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+nvshmem::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks,
+              low_latency_mode ? LEGACY_NUM_MAX_NVL_PEERS : 0);
+rdma_buffer_ptr = nvshmem::alloc(num_rdma_bytes,
+                                 LEGACY_NUM_BUFFER_ALIGNMENT_BYTES);
+nvshmem::barrier(true);
+```
+
+normal 中，每个本地 `nvl_rank` 分别形成一个包含各节点 `rdma_rank` 的 NVSHMEM world；`rdma_buffer_ptr` 是各 PE 同规则分配并注册给 NIC 的 symmetric heap。远端访问按“相同 symmetric offset + 目标 PE”翻译，节点内其他 GPU 则由 `buffer_ptrs[]` CUDA IPC 映射访问。
+
+#### 1.1.3 从 symmetric 地址到 NIC DMA：QP、key、WQE、doorbell
+
+[`ibgda_device.cuh`](../csrc/kernels/legacy/ibgda_device.cuh) 的 payload 调用链是：
+
+```text
+internode::dispatch/combine
+  -> nvshmemi_ibgda_put_nbi_warp
+     -> ibgda_get_rc(dst_pe, qp_id)
+     -> ibgda_get_lkey_and_rkey
+     -> ibgda_reserve_wqe_slots
+     -> ibgda_write_rdma_write_wqe
+     -> ibgda_submit_requests
+        -> ibgda_post_send
+           -> ibgda_update_dbr + ibgda_ring_db
+```
+
+QP 选择（[`ibgda_device.cuh:81-86`](../csrc/kernels/legacy/ibgda_device.cuh#L81)）：
+
+```cpp
+return &state->globalmem.rcs[
+    pe * num_rc_per_pe * state->num_devices_initialized +
+    id % (num_rc_per_pe * state->num_devices_initialized)];
+```
+
+`pe` 是目标 `rdma_rank`；`id` 通常是 `channel_id`，反向 credit 还可用 `channel_id + num_channels`。索引包含 NIC device 数，所以 QP 数、channel 数和 rail 数需一起分析。
+
+key/地址翻译（[`ibgda_device.cuh:205-232`](../csrc/kernels/legacy/ibgda_device.cuh#L205)）：
+
+```cpp
+auto idx = ((laddr - heap_start) >> log2_cumem_granularity)
+         * state->num_devices_initialized + dev_idx;
+*lkey = state->constmem.lkeys[idx].key;
+auto roffset = raddr - heap_start;
+*out_raddr = reinterpret_cast<uint64_t>(
+    nvshmemi_device_state_d.peer_heap_base_remote[dst_pe]) + roffset;
+*out_rkey = device_key.key;
+return min(lchunk_size, rchunk_size);
+```
+
+`lkey` 授权 NIC 读本地 GPU buffer，`rkey` 授权远端写注册区。调用方的 `raddr` 是本 PE symmetric VA，helper 用 offset 加目标 PE remote heap base。返回本地/远端 registration chunk 剩余长度的较小值，所以跨界逻辑 put 会拆成多个 WQE；72 B metadata put也不是硬件原子写。
+
+warp 填 WQE（[`ibgda_device.cuh:335-380`](../csrc/kernels/legacy/ibgda_device.cuh#L335)）：
+
+```cpp
+if (lane_id == 0)
+    base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
+if (lane_id < num_wqes)
+    ibgda_write_rdma_write_wqe(..., base_wqe_idx + lane_id, ...);
+__syncwarp();
+if (lane_id == 0)
+    ibgda_submit_requests<kAlwaysDoPostSend>(
+        qp, base_wqe_idx, num_wqes, message_idx);
+```
+
+lane 0 预留连续 slot；每个有效 lane 填一个注册 chunk 的 control、remote address/rkey 和 local data/lkey segment。提交端（[`ibgda_device.cuh:128-166`](../csrc/kernels/legacy/ibgda_device.cuh#L128)）执行：
+
+```cpp
+__threadfence();  // WQE 内容先对设备可见
+while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx)
+       != base_wqe_idx) { }
+ibgda_update_dbr(qp, new_wqe_idx);
+ibgda_ring_db(qp, new_wqe_idx);
+```
+
+`ready_idx` 让共享 QP 的提交形成无空洞前缀；DBR 记录下一个空 WQEBB，doorbell 触发 NIC 拉取 WQE。`__threadfence()` 保证 WQE 写先于 doorbell，不代表远端完成。
+
+#### 1.1.4 payload、tail atomic 与 CQ/quiet
+
+internode dispatch coordinator 先 put payload，再在同一 `channel_id` QP 上提交 tail AMO（[`internode.cu:812-845`](../csrc/kernels/legacy/internode.cu#L812)）：
+
+```cpp
+nvshmemi_ibgda_put_nbi_warp<true>(
+    dst_ptr, src_ptr, num_bytes_per_msg,
+    dst_pe, channel_id, lane_id, 0);
+__syncwarp();
+if (lane_id == dst_rdma_rank)
+    nvshmemi_ibgda_amo_nonfetch_add(
+        rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
+        dst_pe, channel_id, dst_rdma_rank == rdma_rank);
+```
+
+远端 Forwarder 观察到 tail 后才消费 ring slot。`quiet` 则按当前提交前缀轮询 CQ（[`ibgda_device.cuh:462-494`](../csrc/kernels/legacy/ibgda_device.cuh#L462)）：
+
+```cpp
+uint64_t prod_idx = state->use_async_postsend
+    ? ld_na_relaxed(qp->tx_wq.prod_idx)
+    : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
+```
+
+V1 normal 不在每个 chunk 后 quiet；`notify_dispatch` 在清理/复用 RDMA buffer 前 quiet 旧 QP，再做 NVSHMEM/NVLink barrier。边界是：
+
+- `put_nbi` 是非阻塞提交，不等于远端已可消费；
+- `quiet` 是完成/复用边界，`fence`/`threadfence` 主要排序；
+- payload→tail 依赖当前实现将二者排在同一 RC QP；独立 QP 之间不能照搬。
+
+#### 1.1.5 IBGDA 仍然是“SM 通信方案”
+
+normal internode 的 sender warp 组包，sender coordinator 填 WQE/doorbell，forwarder 轮询 RDMA tail 并转发，NVL receiver 轮询并落输出。NIC 飞行阶段不需要逐消息 CPU proxy，但这些常驻 block 仍参与 GPU progress：
+
+```text
+IBGDA = GPU 直接驱动网络控制面
+     != 不占 GPU SM
+     != 整个 dispatch/combine 期间没有 CUDA kernel
+```
+
+V1 low-latency 的“网络在途阶段 0 communication SM”来自拆分 SEND/RECV kernel，不是 IBGDA 自动带来的性质。两条 V1 路径在需要网络传输、且未命中本地 P2P bypass 时都会使用 IBGDA，但 GPU progress 的组织不同；单节点 normal 数据面仍只走 CUDA IPC/NVLink。
+
+### 1.2 经典双 micro-batch 重叠图
+
 
 ![DeepEP V1：传统通信 SM 重叠与无通信 SM 后台 RDMA 重叠对比](../figures/low-latency.png)
 
@@ -349,7 +558,7 @@ sequenceDiagram
     N-->>P: mapped host counters ready
     P->>P: allocate exact recv tensors
     P->>S: launch dispatch
-    S->>Q: push x/src/topk/weights/scales; release tail
+    S->>Q: push x/src/topk/weights/scales，release tail
     R->>Q: acquire tail, copy token, advance head
     R-->>P: recv_x + routing handle
 ```
@@ -1266,6 +1475,157 @@ legacy 内核可使用 `ld.global.nc.L1::no_allocate` 等激进读取方式。�
 8. [`intranode::combine`](../csrc/kernels/legacy/intranode.cu#L706) 与 [`internode::combine`](../csrc/kernels/legacy/internode.cu#L1721)：看回传和规约。
 9. [`Config`](../csrc/legacy/config.hpp)：把代码中的所有 buffer offset 与 size hint 对上。
 
+### 15.1 知识点 → 源码符号 → 运行时作用完整索引
+
+| 知识点 | 项目代码位置 / 符号 | 代码在运行时做什么 |
+|---|---|---|
+| rank 拓扑 | [`buffer.hpp:113-121`](../csrc/legacy/buffer.hpp#L113) `Buffer` constructor | 固定 `rdma_rank=rank/8`、`nvl_rank=rank%8` 与两级域大小 |
+| IPC/NVLink 建立 | [`buffer.hpp:227-252`](../csrc/legacy/buffer.hpp#L227) `Buffer::sync` | 只打开本节点 peer handle，并把 8 项 pointer table 复制到 GPU |
+| IBGDA 初始化 | [`legacy.py:103-135`](../deep_ep/buffers/legacy.py#L103)、[`buffer.hpp:255-285`](../csrc/legacy/buffer.hpp#L255) | 建跨节点同号 GPU 的 NVSHMEM PE，分配 symmetric heap |
+| QP/key/WQE/doorbell | [`ibgda_device.cuh:81-380`](../csrc/kernels/legacy/ibgda_device.cuh#L81) | channel→QP，symmetric offset→remote key/address，warp 填 WQE并提交 |
+| layout 去重统计 | [`layout.cu:10-149`](../csrc/kernels/legacy/layout.cu#L10) | top-k→owner rank/expert；同一 token 对同一 rank 布尔去重 |
+| normal 路径分流 | [`legacy.py:322-405`](../deep_ep/buffers/legacy.py#L322) `dispatch` | `num_rdma_ranks>1` 选择 internode，否则选择 intranode；封装 cached handle |
+| 单节点 notify | [`intranode.cu:26-128`](../csrc/kernels/legacy/intranode.cu#L26) | IPC 写 count，barrier 后对 source 维 prefix，并写 mapped host counter |
+| 单节点队列 | [`intranode.cu:212-546`](../csrc/kernels/legacy/intranode.cu#L212) | sender 发布 payload/release tail，receiver acquire tail/消费/归还 head |
+| 两 block/channel | [`internode.cu:452-516`](../csrc/kernels/legacy/internode.cu#L452) | `blockIdx.x/2` 得 channel，偶/奇 block 展开五类 warp 角色 |
+| token/channel/warp 切分 | [`internode.cu:587-645`](../csrc/kernels/legacy/internode.cu#L587) | channel 切连续 token 区间，7 个 sender warp 再交错分片 |
+| 72 B channel directory | [`internode.cu:592-623`](../csrc/kernels/legacy/internode.cu#L592) | 8 对 NVL prefix + 1 对 RDMA prefix，以负数 ready 编码发布 |
+| symmetric/asymmetric buffer | [`buffer.cuh:35-130`](../csrc/kernels/legacy/buffer.cuh#L35) | NVSHMEM send/recv 双区与 CUDA IPC peer pointer 的不同地址公式 |
+| RDMA ring 与 credit | [`internode.cu:647-845`](../csrc/kernels/legacy/internode.cu#L647) | 等 head credit，chunk put 后同 QP tail AMO；lazy 返回最小安全 head |
+| RDMA→NVLink forward | [`internode.cu:859-1133`](../csrc/kernels/legacy/internode.cu#L859) | 解 directory/SourceMeta，只向位图命中的目标本地 GPU 转发 |
+| dispatch handle | [`buffer.hpp:1121-1125`](../csrc/legacy/buffer.hpp#L1121)、[`legacy.py:479-502`](../deep_ep/buffers/legacy.py#L479) | 保存 source meta、两级 prefix、RDMA/NVL logical head，供 cached/combine 使用 |
+| 单节点 combine | [`intranode.cu:706-1000`](../csrc/kernels/legacy/intranode.cu#L706) | 按 dispatch logical slot 回读贡献，加法规约并按最慢 warp 归还 credit |
+| 跨节点 combine | [`internode.cu:1721-2281`](../csrc/kernels/legacy/internode.cu#L1721) | 节点内先规约、跨节点 put、源节点最终规约；不是 dispatch 倒放 |
+| stream/event/lifetime | [`buffer.hpp:875-1428`](../csrc/legacy/buffer.hpp#L875) | compute/comm stream wait、event 返回、`record_stream` 保证 allocator 生命周期 |
+| 参数与队列不变量 | [`config.hpp:10-89`](../csrc/legacy/config.hpp#L10) | chunk/capacity 对齐、半容量余量、偶数 SM 等 host 断言 |
+| benchmark/timeout | [`testing.py:12-60`](../deep_ep/utils/testing.py#L12)、[`test_internode.py`](../tests/legacy/test_internode.py)、[`compiled.cuh:17-18`](../csrc/kernels/legacy/compiled.cuh#L17) | 定义 warmup/L2 flush/有效字节口径，并以 device cycle watchdog 定位队列停滞 |
+
+### 15.2 五段关键源码伴读
+
+#### 15.2.1 拓扑不是推测：商/余数直接定义两级坐标
+
+[`buffer.hpp:113-121`](../csrc/legacy/buffer.hpp#L113)：
+
+```cpp
+EP_HOST_ASSERT(num_ranks < 8 || num_ranks % 8 == 0);
+rdma_rank = rank / LEGACY_NUM_MAX_NVL_PEERS;
+nvl_rank = rank % LEGACY_NUM_MAX_NVL_PEERS;
+num_rdma_ranks = std::max(1, num_ranks / 8);
+num_nvl_ranks = std::min(num_ranks, 8);
+```
+
+第一行只允许小于 8 的单 NVLink 域，或 8 的整数倍；商是节点/跨节点 PE 维，余数是本地 GPU 维。它证明“8 GPU 一组”是该 legacy 实现的地址模型，不是 MoE 算法本身的普适定理。Python 随后用 `get_num_rdma_ranks()>1` 选择 internode 或 intranode kernel。
+
+#### 15.2.2 Layout 为什么对 rank 去重、对 expert 不去重
+
+[`layout.cu:78-120`](../csrc/kernels/legacy/layout.cu#L78) 的 rank 统计核心是：
+
+```cpp
+int is_in_rank[kNumRanksPerSM] = {0};
+for (int j = 0; j < num_topk; ++j) {
+    int expert_idx = shifted_topk_idx[j];
+    int rank_idx = expert_idx / num_expert_per_rank - rank_begin_idx;
+    is_in_rank[rank_idx]++;
+}
+shifted_is_token_in_rank[j + rank_begin_idx] = (is_in_rank[j] > 0);
+num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0);
+```
+
+一个 token 即使在同一目标 rank 命中多个 expert，hidden 只需向该 rank 发送一次，所以最后布尔化；expert 计数仍逐 top-k selection 累加，用于目标端 grouped GEMM prefix。这就是“rank traffic”和“expert load”两个统计口径不能互换的代码原因。
+
+接收端再把 global expert id 局部化（[`internode.cu:1173-1184`](../csrc/kernels/legacy/internode.cu#L1173)）：
+
+```cpp
+idx_value = (idx_value >= local_expert_begin &&
+             idx_value < local_expert_end)
+          ? idx_value - local_expert_begin : -1;
+weight_value = idx_value >= 0 ? weight_value : 0.0f;
+recv_topk_idx[recv_idx] = idx_value;
+recv_topk_weights[recv_idx] = weight_value;
+```
+
+token 可因 rank 去重只到达一次；不属于该 rank 的其他 top-k 槽保留为 `-1/0`，避免错误投给本地 expert。
+
+#### 15.2.3 有界队列的正确性落在 payload→tail→head 三步
+
+单节点与跨节点虽然搬运介质不同，都遵守同一个生产/消费骨架。单节点代码的最小形态（[`intranode.cu:356-411`](../csrc/kernels/legacy/intranode.cu#L356)、[`449-528`](../csrc/kernels/legacy/intranode.cu#L449)）：
+
+```cpp
+// producer: 保存反向 logical slot，写 payload 后发布 tail
+send_head[token_idx * kNumRanks + dst] = selected ? cached_tail : -1;
+/* payload / source / top-k stores */
+st_release_sys_global(channel_tail_idx.buffer(), cached_tail);
+
+// consumer: 先 acquire tail，读完再归还 head credit
+cached_tail = ld_acquire_sys_global(channel_tail_idx.buffer());
+/* copy x / source / top-k / scales */
+cached_head += num_recv_tokens;
+st_relaxed_sys_global(channel_head_idx.buffer(), cached_head);
+```
+
+`head/tail` 是单调 absolute index，实际 slot 才 `% capacity`；release tail 是 payload 的发布点，acquire tail 是消费边界。`send_head` 记录的也是逻辑 slot，combine 才能沿原路读取。若先复用物理 slot、再更新 tail/head，wrap-around 时就会出现“数量对、token 错”的静默错误。
+
+跨节点 coordinator 把 payload put 与 tail AMO 排在同一 `channel_id` QP（[`internode.cu:817-845`](../csrc/kernels/legacy/internode.cu#L817)）：
+
+```cpp
+nvshmemi_ibgda_put_nbi_warp<true>(
+    dst_ptr, src_ptr, num_bytes_per_msg,
+    dst_pe, channel_id, lane_id, 0);
+__syncwarp();
+if (lane_id == dst_rdma_rank)
+    nvshmemi_ibgda_amo_nonfetch_add(
+        rdma_channel_tail.buffer(rdma_rank),
+        num_tokens_to_issue, dst_pe, channel_id,
+        dst_rdma_rank == rdma_rank);
+```
+
+远端 forwarder 对 tail 做 system acquire 后才读 ring payload。credit 的反向 AMO 使用 `channel_id + num_channels`，把前向数据 QP 与反向 head 更新分开；这也解释了 QP 数断言为何与 channel/SM 数相关。
+
+#### 15.2.4 Combine 的两级模板调用证明它不是 dispatch 倒放
+
+跨节点 combine 先在目标节点内把最多 8 个 local GPU 的贡献相加，再把部分和跨节点发送，源节点最后对多个 node 的部分和相加：
+
+```cpp
+// internode.cu:2091-2105，节点内部分规约
+combine_token<LEGACY_NUM_MAX_NVL_PEERS, /* ... */>(/* NVL inputs */);
+
+// internode.cu:2123-2141，部分和跨节点 put + tail
+nvshmemi_ibgda_put_nbi_warp<true>(/* ... */, channel_id, /* ... */);
+nvshmemi_ibgda_amo_nonfetch_add(/* RDMA tail */, /* ... */);
+
+// internode.cu:2207-2221，源节点最终规约
+combine_token<kNumRDMARanks, /* ... */>(/* RDMA partial sums */);
+```
+
+模板参数直接对应“节点内 8 路”和“跨节点 N 路”。`combined_x` 的 kernel 只做 addition；可选 `topk_weights` 走独立 buffer/规约输出，没有 `x *= weight`。这就是 normal 与 Low-Latency combine 权重语义不同的源码边界。
+
+#### 15.2.5 Stream 依赖、完成事件和 allocator 生命周期是三件事
+
+C++ host 路径（[`buffer.hpp:1295-1420`](../csrc/legacy/buffer.hpp#L1295)）按下面的顺序组织：
+
+```cpp
+auto compute_stream = at::cuda::getCurrentCUDAStream();
+if (previous_event.has_value())
+    stream_wait(comm_stream, previous_event->event());
+else
+    stream_wait(comm_stream, compute_stream);
+
+/* launch communication kernels on comm_stream */
+
+if (async_finish) {
+    event = EventHandle(comm_stream);
+    record_stream(output, comm_stream);
+} else {
+    stream_wait(compute_stream, comm_stream);
+}
+```
+
+- 第一段只建立“输入何时可读”的执行依赖；`previous_event` 可把前一异步阶段直接接到通信 stream。
+- `EventHandle` 表示“调用者何时可消费结果”，不自动延长所有 tensor 的 allocator 生命周期。
+- `record_stream` 防止 caching allocator 在 comm stream 完成前复用 storage；不能用一个 event 概念替代它。
+
+测试代码同样要按源码口径解释。`testing.py` 默认先 warmup 50 次、测试 50 次，每轮可冲刷约 256 MB L2，并对 CUDA event 结果使用 `times[1:]`；`test_internode.py` 的 dispatch RDMA 发送字节按“token 对目标 node 去重”统计，不含 `SourceMeta`、72 B directory、head/tail、WQE/CQ 与 wire header。因此文中的 GB/s 是算法有效流量，不能当作 NIC on-wire 字节率。
+
 ## 16. 研究依据与参考资料
 
 本文采用“当前 commit 源码为实现事实、项目/硬件官方资料为语义背景、性能模型必须实验反证”的证据顺序。外部 NVIDIA 文档会随版本更新，解释的是 API/硬件模型；实际 bundled NVSHMEM 与本 commit 的具体行为仍需结合构建版本验证。
@@ -1297,6 +1657,8 @@ legacy 内核可使用 `ld.global.nc.L1::no_allocate` 等激进读取方式。�
 | [NVSHMEM: Using NVSHMEM](https://docs.nvidia.com/nvshmem/api/latest/using.html) | symmetric heap 是各 PE 的对称分配，以 `<symmetric address, PE>` 定位；IBGDA/GDAKI 可由 GPU 承担网络控制面和数据面 | 2026-08-26 |
 | [NVSHMEM API Overview](https://docs.nvidia.com/nvshmem/api/latest/api/overview.html) | `fence`/`quiet`/barrier 的作用范围与完成/可见性边界，CPU/GPU 发出者不能混为一谈 | 2026-08-26 |
 | [NVSHMEM IBGDA Performance Guide](https://docs.nvidia.com/nvshmem/release-notes-install-guide/best-practice-guide/performance.html) | QP/DCI 数、资源、GPU WQE 提交和同步开销之间的官方调优背景 | 2026-08-26 |
+| [NVIDIA GPUDirect Async / IBGDA 原理](https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/) | 对照 CPU proxy 与 GPU WQE/DBR/doorbell/NIC DMA 的逐消息控制路径 | 2026-08-26 |
+| [NVIDIA NVSHMEM 3.0 CPU-assisted IBGDA](https://developer.nvidia.com/blog/?p=88550) | 证明 GPU 生成 WR、CPU 辅助 doorbell 仍属于 IBGDA 中间模式 | 2026-08-26 |
 | [CUDA Programming Guide: Advanced Kernel Programming](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html) | system-scope acquire/release 与 async/TMA proxy synchronization 的官方语义背景 | 2026-08-26 |
 | [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/) | `ld.global.nc`、cache operator 和 scope/semantics 修饰符的规范入口 | 2026-08-26 |
 
@@ -1313,4 +1675,4 @@ V1 SM 方案的本质是：**用若干通信 SM 驱动分通道有界队列，�
 
 - 关注 decode、小 batch、纯 RDMA 与 receive hook：继续阅读 [V1 Low-Latency 实现](implementation-v1-low-latency.md)。
 - 关注 JIT、ElasticBuffer、新 topology/layout 与 V2 指标口径：继续阅读 [V2 Elastic 实现](implementation-v2-elastic.md)。
-- 回看两种 V1 策略在经典双 micro-batch 图中的对应关系：见 [1.1 节](#11-经典双-micro-batch-重叠图)。
+- 回看两种 V1 策略在经典双 micro-batch 图中的对应关系：见 [1.2 节](#12-经典双-micro-batch-重叠图)。
